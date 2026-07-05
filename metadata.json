@@ -1,0 +1,6 @@
+{
+  "name": "Atlas OS",
+  "description": "Atlas Autonomous Business Operating System — Where AI executives run business departments autonomously under human strategy and approvals.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
