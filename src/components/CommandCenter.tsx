@@ -25,10 +25,14 @@ export default function CommandCenter({ isOpen, onClose, onNavigate, onRunAction
   const inputRef = useRef<HTMLInputElement>(null);
 
   const quickActions = [
-    { key: 'report', name: 'Generate Board Report', desc: 'Assembles comprehensive Q3 executive summaries', route: '/boardroom' },
+    { key: 'report', name: 'Generate Board Report', desc: 'Assembles comprehensive executive board summary', route: '/boardroom' },
+    { key: 'first_client', name: '🚀 Launch First Client Campaign', desc: 'Full autonomous zero-to-client pipeline — ICP, outbound, qualify, propose', route: '/goals' },
+    { key: 'goals', name: 'Set Mission Goal', desc: 'Define a company objective and let Atlas plan milestones', route: '/goals' },
     { key: 'cashflow', name: 'Optimize Cash Flow', desc: 'Queries Aurelia on treasury buffer targets', route: '/finance' },
     { key: 'strategy', name: 'Schedule Strategy Session', desc: 'Convenes AI executives on custom targets', route: '/strategy' },
-    { key: 'recruit', name: 'Recruit Core Engineer', desc: 'Instructs People Ops on technical search filters', route: '/workforce' },
+    { key: 'collaboration', name: 'Convene Executive Session', desc: 'Multi-executive discussion with AI consensus', route: '/collaboration' },
+    { key: 'governance', name: 'Run Atlas as Acting CEO', desc: 'Process all pending decisions via governance policy', route: '/governance' },
+    { key: 'recruit', name: 'Recruit Core Engineer', desc: 'Instructs Sage on technical search filters', route: '/workforce' },
   ];
 
   // Hotkey listener for ⌘K or Ctrl+K is set up at App level, but let's handle inputs focus here

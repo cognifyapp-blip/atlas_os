@@ -1,1088 +1,983 @@
 /**
- * @license
- * SPDX-License-Identifier: Apache-2.0
+ * Atlas OS — API Gateway
+ *
+ * Fully database-backed. All 10 AI executives are wired to real routes.
+ * No in-memory state — everything persists to Neon PostgreSQL via Prisma.
+ *
+ * Executive Roster:
+ *   Atlas   (CEO Assistant) · Aurelia (Finance AI) · Zephyr  (Sales AI)
+ *   Aria    (Marketing AI)  · Lyra   (Customer Success AI)
+ *   Sage    (HR AI)         · Orion  (Operations AI) · Lexis (Legal AI)
+ *   Forge   (Developer AI)  · Iris   (Intelligence AI)
  */
 
 import express from 'express';
 import path from 'path';
-import fs from 'fs';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
-import { Agent, Decision, MemoryEntry, FeedEvent, Lead, Proposal, Workflow, OrganizationContext } from './src/types';
+import rateLimit from 'express-rate-limit';
 
-// Load environment variables
-dotenv.config();
+dotenv.config({ path: '.env.local' });
+
+import webhookRouter from './src/routes/webhooks.js';
+import internalRouter from './src/routes/internal.js';
+import executiveRouter from './src/routes/executives.js';
+import integrationRouter from './src/routes/integrations.js';
+import collaborationRouter from './src/routes/collaboration.js';
+import goalsRouter from './src/routes/goals.js';
+import { requireAuth } from './src/middleware/requireAuth.js';
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
-const PORT = 3000;
-
-// Initialize Gemini SDK with User-Agent set to 'aistudio-build'
-const geminiApiKey = process.env.GEMINI_API_KEY || '';
-const hasGeminiKey = !!geminiApiKey;
-
-const ai = new GoogleGenAI({
-  apiKey: geminiApiKey,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+// General limiter: 300 req / 15 min per IP — protects all API routes
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again later.' },
 });
 
-// -----------------------------------------------------------------------------
-// In-Memory Database (Isolated per Organization)
-// -----------------------------------------------------------------------------
-let orgContext: OrganizationContext = {
-  name: '',
-  industry: '',
-  size: '',
-  goals: '',
-  challenges: '',
-  softwareStack: '',
-  initialized: false,
-};
+// Strict limiter for AI-heavy endpoints that trigger LLM calls
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'AI rate limit reached. Please wait a moment before retrying.' },
+});
 
-let dayZeroBriefing = {
-  briefing: '',
-  insights: [] as string[],
-};
+app.use('/api/', generalLimiter);
+app.use('/api/v1/strategy-session', aiLimiter);
+app.use('/api/v1/command-center', aiLimiter);
+app.use('/api/v1/boardroom/report', aiLimiter);
+app.use('/api/v1/leads/:id/qualify', aiLimiter);
 
-// Initial Workforce Agents
-let agents: Agent[] = [
-  {
-    id: 'ceo_assistant',
-    name: 'CEO Assistant (Atlas)',
-    department: 'Executive Office',
-    role: 'Synthesizer & Strategic Chief of Staff',
-    avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=150&q=80',
-    status: 'Idle',
-    lastAction: 'Awaiting strategic directives from human CEO.',
-    bio: 'Designed to orchestrate department heads, synthesize cross-functional business analysis, and present high-level operational signals to human leadership.',
-    goals: ['Synthesize multi-department data', 'Present actionable recommendations', 'Maintain executive alignment'],
-    tools: ['Search Memory', 'Draft Strategic Briefing', 'Coordinate Cross-Department Collaboration'],
-    metrics: { tasksCompleted: 12, decisionsMade: 4, valueGenerated: 0 },
-  },
-  {
-    id: 'finance_ai',
-    name: 'Finance AI (Aurelia)',
-    department: 'Finance',
-    role: 'Financial Analyst & Treasurer',
-    avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=150&q=80',
-    status: 'Idle',
-    lastAction: 'Completed Q2 revenue forecast update.',
-    bio: 'Specializes in financial models, cash flow management, automated billing, expense analysis, and bottom-line margin optimization.',
-    goals: ['Protect company runway', 'Automate invoice recovery', 'Forecast capital allocation efficiency'],
-    tools: ['Draft Proposal', 'Generate Invoice', 'Analyze Profit & Loss', 'Optimize Cash Flow'],
-    metrics: { tasksCompleted: 45, decisionsMade: 12, valueGenerated: 184000 },
-  },
-  {
-    id: 'sales_ai',
-    name: 'Sales AI (Zephyr)',
-    department: 'Sales',
-    role: 'Lead Generation & Account Strategist',
-    avatar: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=150&q=80',
-    status: 'Idle',
-    lastAction: 'Qualified lead catalog from external channels.',
-    bio: 'An autonomous pipeline machine that qualifies inbound leads, scores accounts, handles early negotiations, and structures high-probability deals.',
-    goals: ['Qualify 100% of incoming leads within 1 hour', 'Optimize deal-stage conversion rates', 'Provide actionable account briefs'],
-    tools: ['Score Lead', 'Draft Pitch Deck', 'Search Contact History'],
-    metrics: { tasksCompleted: 94, decisionsMade: 32, valueGenerated: 421000 },
-  },
-  {
-    id: 'marketing_ai',
-    name: 'Marketing AI (Aria)',
-    department: 'Marketing',
-    role: 'CMO Assistant & Content Strategist',
-    avatar: 'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&w=150&q=80',
-    status: 'Idle',
-    lastAction: 'Reviewed ad campaign click-through analytics.',
-    bio: 'Tracks performance marketing, synthesizes target persona content, and manages digital campaigns across networks autonomously.',
-    goals: ['Improve customer acquisition cost (CAC) by 15%', 'Maintain unified brand voice', 'Identify high-yield search keywords'],
-    tools: ['Generate Copy', 'Review Ad Performance', 'Create Marketing Plan'],
-    metrics: { tasksCompleted: 71, decisionsMade: 18, valueGenerated: 85000 },
-  },
-];
+// Raw body BEFORE json — required for SVIX webhook signature verification
+app.use('/api/webhooks', express.raw({ type: 'application/json' }), webhookRouter);
+app.use(express.json());
+app.use('/api/internal', internalRouter);
 
-let decisions: Decision[] = [
-  {
-    id: 'dec_1',
-    title: 'Review Cape Town Expansion Proposal',
-    summary: 'Aurelia (Finance AI) and Zephyr (Sales AI) propose launching a targeted pilot inside the Cape Town tech corridor.',
-    description: 'Based on Q3 regional indicators and an inbound inbound influx of qualified interest, Sales AI recommends a local operational pilot. Finance AI estimates the total cost at $15,000 with a high probability of generating $42,000 in early recurring revenue.',
-    reasoning: 'Regional CRM analysis indicates Cape Town tech leads convert at a 34% higher rate than the standard baseline. Early market penetration provides a low CAC environment with strategic partnerships ready to sign.',
-    impact: 'Generates $42,000 ARR, improves margins by 4% in the EMEA region.',
-    confidence: 88,
-    status: 'pending',
-    contributors: ['sales_ai', 'finance_ai'],
-    type: 'general',
-    createdAt: new Date().toISOString(),
-  },
-];
+// ─── Auth guard — applied to all /api/v1/* routes ─────────────────────────────
+// Public exceptions (auth/me, auth/sync, onboarding, stream-events) are
+// handled inside the middleware itself.
+app.use('/api/v1', requireAuth);
 
-let memories: MemoryEntry[] = [
-  {
-    id: 'mem_1',
-    text: 'Company Mission Statement: Atlas OS aims to create absolute administrative efficiency where AI executive agents handle heavy operations while humans retain strategic veto and steering capabilities.',
-    type: 'Document',
-    sourceSystem: 'Internal Wiki',
-    actor: 'CEO',
-    createdAt: new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString(),
-    tags: ['mission', 'governance', 'charter'],
-  },
-];
+app.use('/api/v1/executives', executiveRouter);
+app.use('/api/integrations', integrationRouter);
+app.use('/api/v1/collaboration', collaborationRouter);
 
-let feeds: FeedEvent[] = [
-  {
-    id: 'feed_1',
-    agentId: 'ceo_assistant',
-    agentName: 'CEO Assistant',
-    department: 'Executive Office',
-    action: 'System Boot',
-    text: 'Atlas Operating System successfully initialized. Autonomous worker loops standing by.',
-    timestamp: new Date().toISOString(),
-    status: 'info',
-  },
-];
+// ─── Governance routes ────────────────────────────────────────────────────────
+import governanceRouter from './src/routes/governance.js';
+app.use('/api/v1/governance', governanceRouter);
+app.use('/api/v1', goalsRouter);
 
-let leads: Lead[] = [
-  {
-    id: 'lead_1',
-    name: 'Thabo Ndlovu',
-    company: 'Silo Technologies',
-    email: 'thabo@silotech.co.za',
-    phone: '+27 82 123 4567',
-    status: 'new',
-    source: 'Inbound Webform',
-    value: 28000,
-    createdAt: new Date().toISOString(),
-  },
-];
+// ─── SSE broadcast ────────────────────────────────────────────────────────────
+let sseClients: express.Response[] = [];
 
-let proposals: Proposal[] = [];
-
-let workflows: Workflow[] = [
-  {
-    id: 'wf_deal_closed',
-    name: 'Autonomous Lead Conversion and Proposal Delivery',
-    status: 'paused',
-    steps: [
-      { name: 'Assess & Score Lead', status: 'pending', actorId: 'sales_ai', actionDescription: 'Analyze company size, industry, and convert probability.' },
-      { name: 'Structure Commercial Proposal', status: 'pending', actorId: 'finance_ai', actionDescription: 'Assemble product catalog pricing and structure invoice.' },
-      { name: 'CEO Final Approval', status: 'pending', actorId: 'ceo_assistant', actionDescription: 'Submit compiled strategic brief to human CEO dashboard.' },
-      { name: 'Dispatch & Log Deal', status: 'pending', actorId: 'sales_ai', actionDescription: 'Email approved PDF assets and register memory blocks.' },
-    ],
-    currentStepIndex: 0,
-    triggerEvent: 'Lead Qualification Triggered',
-    updatedAt: new Date().toISOString(),
-  },
-];
-
-// -----------------------------------------------------------------------------
-// Server-Sent Events (SSE) stream state
-// -----------------------------------------------------------------------------
-let sseClients: any[] = [];
-
-function broadcastEvent(event: any) {
-  sseClients.forEach((client) => {
-    client.write(`data: ${JSON.stringify(event)}\n\n`);
-  });
+export function broadcastEvent(event: unknown) {
+  const data = `data: ${JSON.stringify(event)}\n\n`;
+  sseClients.forEach((c) => c.write(data));
 }
 
-function pushFeedEvent(agentId: string, action: string, text: string, status: 'success' | 'warning' | 'info' | 'critical' = 'info') {
-  const agent = agents.find((a) => a.id === agentId);
-  const event: FeedEvent = {
-    id: `feed_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-    agentId,
-    agentName: agent ? agent.name : 'System',
-    department: agent ? agent.department : 'System',
-    action,
-    text,
-    timestamp: new Date().toISOString(),
-    status,
-  };
-  feeds.unshift(event);
-  if (feeds.length > 100) feeds.pop();
-  broadcastEvent({ type: 'feed', data: event });
-}
-
-// -----------------------------------------------------------------------------
-// Gemini Assistance Helpers
-// -----------------------------------------------------------------------------
-async function generateDayZeroBriefing(context: OrganizationContext) {
-  if (!hasGeminiKey) {
-    return {
-      briefing: `### Welcome to ${context.name || 'your new business'}\n\nWe have set up your digital headquarters based on your context in the **${context.industry || 'General Services'}** industry. Since the Gemini API key was not detected, this is a local fallback briefing. Complete your onboarding to begin exploring.`,
-      insights: [
-        'Analyze regional operating metrics for cost optimization.',
-        'Implement automated lead scoring to improve response times.',
-        'Review cash flow cycles to unlock locked capital.',
-      ],
-    };
-  }
-
-  try {
-    const prompt = `You are Atlas OS, the executive business AI operating system. The user has just configured their business.
-    Here is the context:
-    - Company Name: ${context.name}
-    - Industry: ${context.industry}
-    - Company Size: ${context.size}
-    - Main Strategy Goals: ${context.goals}
-    - Primary Operational Challenges: ${context.challenges}
-    - Current Software Stack: ${context.softwareStack}
-
-    Task:
-    Generate a high-impact "Day Zero" briefing for the Executive Dashboard. Offer an executive summary overview in Markdown format and a short list of 3 tactical, highly specific operational insights suited to this company profile. Provide output strictly in JSON format matching the schema requested. Do not return standard boilerplate advice; make it highly custom to their goals and stack.`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            briefing: { type: Type.STRING, description: 'Markdown formatted executive overview summarizing initial context and tactical roadmap' },
-            insights: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: 'Exactly 3 concrete strategic action points',
-            },
-          },
-          required: ['briefing', 'insights'],
-        },
-      },
-    });
-
-    const parsed = JSON.parse(response.text || '{}');
-    return {
-      briefing: parsed.briefing || 'Day Zero Briefing compiled successfully.',
-      insights: parsed.insights || [],
-    };
-  } catch (error) {
-    console.error('Gemini error generating Day Zero briefing:', error);
-    return {
-      briefing: `### Tactical Setup for ${context.name}\n\nWe successfully launched your operational workspace for **${context.industry}**. Our system is analyzing trends based on your stated target goals. Let's start qualifying inbound opportunities immediately.`,
-      insights: [
-        'Audit historical CRM conversion ratios to establish an AI sales benchmark.',
-        'Integrate Stripe Webhooks to let Finance AI automatically reconcile accounts.',
-        'Establish automated marketing feedback loop between Aria and Zephyr.',
-      ],
-    };
-  }
-}
-
-async function qualifyLeadWithGemini(lead: Lead, context: OrganizationContext) {
-  if (!hasGeminiKey) {
-    // Local fallback logic
-    const score = 75;
-    const value = lead.value || 15000;
-    const reasoning = `Silo Technologies operates in a sector adjacent to our expertise. With an estimated budget of $${value.toLocaleString()}, they represent a highly viable operational partner. Recommended immediate demo structure.`;
-    return { score, reasoning, estimatedValue: value, recommendedAction: 'Schedule technical integration demo' };
-  }
-
-  try {
-    const prompt = `You are Zephyr, the autonomous Sales AI of Atlas OS.
-    You are evaluating this inbound lead:
-    - Name: ${lead.name}
-    - Company: ${lead.company}
-    - Email: ${lead.email}
-    - Phone: ${lead.phone}
-    - Target Deal Value: $${lead.value}
-    - Source: ${lead.source}
-
-    Context about our business:
-    - Our Industry: ${context.industry}
-    - Strategic Goals: ${context.goals}
-
-    Task:
-    Assess the lead's fit and qualification score (0 to 100). Provide robust qualification reasoning that integrates how this aligns with our target operations, estimate the realistic contract value, and suggest a specific recommended action.`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            score: { type: Type.INTEGER, description: 'Qualification score from 0 to 100' },
-            reasoning: { type: Type.STRING, description: 'Detailed justification for the score' },
-            estimatedValue: { type: Type.NUMBER, description: 'Refined estimated contract value' },
-            recommendedAction: { type: Type.STRING, description: 'Immediate next sales step' },
-          },
-          required: ['score', 'reasoning', 'estimatedValue', 'recommendedAction'],
-        },
-      },
-    });
-
-    return JSON.parse(response.text || '{}');
-  } catch (error) {
-    console.error('Gemini error qualifying lead:', error);
-    return {
-      score: 82,
-      reasoning: 'Inbound profile exhibits high alignment with standard customer avatar. Automated score assigned based on corporate markers.',
-      estimatedValue: lead.value || 25000,
-      recommendedAction: 'Draft and send structured commercial proposal',
-    };
-  }
-}
-
-async function draftProposalWithGemini(lead: Lead, score: number, reasoning: string, value: number, context: OrganizationContext) {
-  if (!hasGeminiKey) {
-    return {
-      content: `# Commercial Agreement & Proposal\n\n**Prepared for:** ${lead.company}\n**Contact:** ${lead.name} (${lead.email})\n**Date:** ${new Date().toLocaleDateString()}\n\n## 1. Executive Summary\nBased on your profile, Atlas proposes a fully integrated operating solution. We value this engagement at **$${value.toLocaleString()}**.\n\n## 2. Deliverables\n- Full SaaS workspace integration\n- Automated department coordination\n- Institutional memory setup\n\n## 3. Commercial Terms\n- Monthly Licensing Fee: $2,500\n- Professional Setup: $5,000`,
-      lineItems: [
-        { description: 'Atlas OS License (Annual)', quantity: 1, price: Math.round(value * 0.7) },
-        { description: 'Custom Professional Implementation', quantity: 1, price: Math.round(value * 0.3) },
-      ],
-    };
-  }
-
-  try {
-    const prompt = `You are Aurelia, the Finance AI. You are drafting a formal commercial agreement and invoice structure for:
-    - Client: ${lead.company}
-    - Attention: ${lead.name}
-    - Estimated Value: $${value}
-    - Sales Score: ${score}/100
-    - Sales Reasoning: ${reasoning}
-
-    Our business profile:
-    - Name: ${context.name}
-    - Industry: ${context.industry}
-
-    Task:
-    Draft a beautiful, highly professional Markdown-formatted commercial proposal. Then, break down this proposal into formal Invoice Line Items (description, quantity, price) that exactly sum up to the target value ($${value}). Return standard items like licensing, configuration, or advisory fees.`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            content: { type: Type.STRING, description: 'Complete proposal in elegant markdown format' },
-            lineItems: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  description: { type: Type.STRING },
-                  quantity: { type: Type.INTEGER },
-                  price: { type: Type.NUMBER },
-                },
-                required: ['description', 'quantity', 'price'],
-              },
-            },
-          },
-          required: ['content', 'lineItems'],
-        },
-      },
-    });
-
-    return JSON.parse(response.text || '{}');
-  } catch (error) {
-    console.error('Gemini error drafting proposal:', error);
-    return {
-      content: `# Commercial Proposal\n\n**Client:** ${lead.company}\n\nWe are pleased to submit this proposal based on standard licensing and operational setup terms.`,
-      lineItems: [
-        { description: 'Atlas Enterprise Suite Subscription', quantity: 1, price: Math.round(value) },
-      ],
-    };
-  }
-}
-
-// -----------------------------------------------------------------------------
-// REST API Gateway Routes (/api/v1/)
-// -----------------------------------------------------------------------------
-
-// Real-Time Events SSE Connection
 app.get('/api/v1/stream-events', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
+    Connection: 'keep-alive',
   });
   res.write('\n');
   sseClients.push(res);
-
-  req.on('close', () => {
-    sseClients = sseClients.filter((client) => client !== res);
-  });
+  req.on('close', () => { sseClients = sseClients.filter((c) => c !== res); });
 });
 
-// Save onboarding details and trigger Day-Zero Briefing
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+import { prisma } from './src/lib/prisma.js';
+import { registerSSEBroadcaster } from './src/services/executives/index.js';
+import { registerSSEBridge } from './src/services/SSEBridge.js';
+import { schedulerService } from './src/services/SchedulerService.js';
+import { executionBridge } from './src/services/ExecutionBridge.js';
+import { registerNotificationBroadcaster } from './src/workers/workers/NotificationWorker.js';
+
+// Wire the SSE broadcaster into every executive service
+registerSSEBroadcaster(broadcastEvent);
+// Wire SSE broadcaster into NotificationWorker (in_app channel)
+registerNotificationBroadcaster(broadcastEvent);
+// Wire SSE bridge for governance engine and other deep services
+registerSSEBridge(broadcastEvent);
+
+/** Resolve org+executive from DB for the default (single) organization. */
+async function getOrgAndExec(execNameFragment: string) {
+  const org = await prisma.organization.findFirst({ where: { initialized: true } });
+  if (!org) throw new Error('No initialized organization found.');
+  const exec = await prisma.aIExecutive.findFirst({
+    where: { organizationId: org.id, name: { contains: execNameFragment } },
+  });
+  if (!exec) throw new Error(`Executive matching "${execNameFragment}" not found.`);
+  return { org, exec };
+}
+
+/** Map Prisma AIExecutive rows to the Agent shape the frontend expects. */
+function toAgentShape(e: any) {
+  return {
+    id: e.id,
+    name: e.name,
+    department: e.department?.name ?? e.role,
+    role: e.role,
+    avatar: e.avatarUrl ?? `https://ui-avatars.com/api/?name=${encodeURIComponent(e.name)}&background=random`,
+    status: e.status === 'IDLE' ? 'Idle' : e.status === 'ACTIVE' ? 'Active' : e.status === 'BUSY' ? 'In Process' : 'Idle',
+    lastAction: e.lastAction ?? 'Standing by.',
+    bio: e.bio ?? '',
+    goals: e.goals ?? [],
+    tools: e.tools ?? [],
+    metrics: {
+      tasksCompleted: e.tasksCompleted,
+      decisionsMade: e.decisionsMade,
+      valueGenerated: e.valueGenerated,
+    },
+  };
+}
+
+// ─── Scheduler manual trigger API ────────────────────────────────────────────
+// POST /api/v1/scheduler/trigger/:event — manually fire any scheduled event
+
+app.post('/api/v1/scheduler/trigger/:event', async (req, res) => {
+  try {
+    const event = req.params.event as Parameters<typeof schedulerService.triggerNow>[0];
+    const validEvents = ['daily_briefing', 'pipeline_review', 'anomaly_detection', 'financial_health', 'payment_reminders', 'weekly_report', 'monthly_report', 'operational_report'];
+    if (!validEvents.includes(event)) {
+      return res.status(400).json({ error: `Unknown event "${event}". Valid: ${validEvents.join(', ')}` });
+    }
+    await schedulerService.triggerNow(event);
+    res.json({ success: true, event, triggeredAt: new Date().toISOString() });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/v1/scheduler/status', (_req, res) => {
+  res.json({ running: schedulerService.isRunning(), checkedAt: new Date().toISOString() });
+});
+
+// ─── Infrastructure metrics ───────────────────────────────────────────────────
+
+app.get('/api/v1/infrastructure/metrics', async (_req, res) => {
+  try {
+    const { SystemHealth } = await import('./src/infrastructure/health/SystemHealth.js');
+    const { RedisHealth } = await import('./src/infrastructure/redis/RedisHealth.js');
+    const { QueueMetrics } = await import('./src/infrastructure/queue/QueueMetrics.js');
+    const { workerManager } = await import('./src/workers/WorkerManager.js');
+    const { integrationRegistry } = await import('./src/integrations/IntegrationRegistry.js');
+
+    const [redisR, queueR, workerR] = await Promise.allSettled([
+      RedisHealth.check(),
+      QueueMetrics.forAll(),
+      Promise.resolve(workerManager.getHealthSummary()),
+    ]);
+
+    // Pull real integration connection status from DB
+    let dbIntegrations: Array<{ provider: string; status: string; lastSyncAt: Date | null }> = [];
+    try {
+      const org = await prisma.organization.findFirst({ where: { initialized: true } });
+      if (org) {
+        dbIntegrations = await prisma.integration.findMany({
+          where: { organizationId: org.id },
+          select: { provider: true, status: true, lastSyncAt: true },
+        });
+      }
+    } catch { /* DB may not have integrations table yet */ }
+
+    const registeredProviders = integrationRegistry.listAll();
+    const connectedCount = dbIntegrations.filter((i) => i.status === 'CONNECTED').length;
+
+    const providerStatuses = registeredProviders.map((p) => {
+      const dbRecord = dbIntegrations.find((i) => i.provider === p.name);
+      return {
+        provider: p.displayName,
+        status: dbRecord?.status === 'CONNECTED' ? 'connected'
+          : dbRecord?.status === 'ERROR' ? 'error'
+          : 'disconnected',
+        lastSync: dbRecord?.lastSyncAt?.toISOString(),
+      };
+    });
+
+    res.json({
+      metrics: {
+        redis: redisR.status === 'fulfilled'
+          ? { status: redisR.value.status, connected: redisR.value.connected, latencyMs: redisR.value.latencyMs, host: redisR.value.host, port: redisR.value.port }
+          : { status: 'unhealthy', connected: false, host: 'unknown', port: 0 },
+        queues: queueR.status === 'fulfilled'
+          ? { totalWaiting: queueR.value.totalWaiting, totalActive: queueR.value.totalActive, totalFailed: queueR.value.totalFailed, metrics: queueR.value.queues }
+          : { totalWaiting: 0, totalActive: 0, totalFailed: 0, metrics: [] },
+        workers: workerR.status === 'fulfilled'
+          ? { total: workerR.value.totalWorkers, running: workerR.value.runningWorkers, stopped: workerR.value.stoppedWorkers, workers: workerR.value.workers }
+          : { total: 0, running: 0, stopped: 0, workers: [] },
+        integrations: {
+          total: registeredProviders.length,
+          connected: connectedCount,
+          providers: providerStatuses,
+        },
+        checkedAt: new Date().toISOString(),
+      },
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Auth routes ──────────────────────────────────────────────────────────────
+
+app.get('/api/v1/auth/me', async (req, res) => {
+  try {
+    const { AuthService } = await import('./src/services/auth/index.js');
+    const ctx = await AuthService.fromRequest(req);
+    res.json({ user: ctx.user, organization: ctx.organization, membership: ctx.membership, permissions: ctx.permissions, redirect: AuthService.getPostLoginRedirect(ctx) });
+  } catch (err: any) {
+    res.status(err.code === 'UNAUTHORIZED' ? 403 : 401).json({ error: err.message });
+  }
+});
+
+app.post('/api/v1/auth/sync', async (req, res) => {
+  try {
+    const { ClerkSyncService, OrganizationService, RoleSyncService, AuthService } = await import('./src/services/auth/index.js');
+    const { clerkUserId, clerkOrgId, clerkRole, clerkUser, clerkOrg } = req.body;
+    if (!clerkUserId) return res.status(400).json({ error: 'clerkUserId required' });
+    if (clerkUser) await ClerkSyncService.syncUser(clerkUser);
+    if (clerkOrg && clerkOrgId) {
+      const org = await ClerkSyncService.syncOrganization(clerkOrg);
+      await OrganizationService.provisionNewOrganization(org.id);
+    }
+    if (clerkOrgId && clerkRole) await RoleSyncService.updateMembershipRole(clerkUserId, clerkOrgId, clerkRole);
+    const dbUser = await prisma.user.findFirst({ where: { externalId: clerkUserId } });
+    const dbOrg = clerkOrgId ? await prisma.organization.findFirst({ where: { externalId: clerkOrgId } }) : null;
+    if (!dbUser || !dbOrg) return res.status(404).json({ error: 'User or org not found after sync.' });
+    const ctx = await AuthService.buildContext(dbUser.id, dbOrg.id);
+    res.json({ user: ctx.user, organization: ctx.organization, redirect: AuthService.getPostLoginRedirect(ctx) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Onboarding ───────────────────────────────────────────────────────────────
+
 app.post('/api/v1/onboarding', async (req, res) => {
   try {
     const { name, industry, size, goals, challenges, softwareStack } = req.body;
+    if (!name || !industry) return res.status(422).json({ error: 'Company name and industry are required.' });
 
-    if (!name || !industry) {
-      return res.status(422).json({ error: 'Company Name and Industry are required fields.' });
-    }
-
-    orgContext = {
-      name,
-      industry,
-      size: size || '1-10',
-      goals: goals || '',
-      challenges: challenges || '',
-      softwareStack: softwareStack || '',
-      initialized: true,
-    };
-
-    // Push feed alert
-    pushFeedEvent('ceo_assistant', 'Initializing Workspace', `Building digital headquarters for ${name}...`, 'info');
-    pushFeedEvent('finance_ai', 'Training Models', `Aurelia analyzing historical context for ${industry} sector...`, 'info');
-    pushFeedEvent('marketing_ai', 'Indexing Channels', 'Aria setting target keyword trackers...', 'info');
-
-    // Generate Day-Zero Briefing via Gemini
-    dayZeroBriefing = await generateDayZeroBriefing(orgContext);
-
-    // Save briefing to memory
-    const memoryId = `mem_briefing_${Date.now()}`;
-    memories.push({
-      id: memoryId,
-      text: `Onboarding Day-Zero Briefing:\n${dayZeroBriefing.briefing}\n\nKey Insights:\n${dayZeroBriefing.insights.join('\n')}`,
-      type: 'Document',
-      sourceSystem: 'Intelligence Layer',
-      actor: 'CEO Assistant',
-      createdAt: new Date().toISOString(),
-      tags: ['briefing', 'strategy', 'onboarding'],
+    // Upsert the organization record
+    const org = await prisma.organization.upsert({
+      where: { id: (await prisma.organization.findFirst())?.id ?? 'new' },
+      create: { name, industry, size: size ?? '1-10', goals: goals ?? '', challenges: challenges ?? '', softwareStack: softwareStack ?? '', initialized: true },
+      update: { name, industry, size: size ?? '1-10', goals: goals ?? '', challenges: challenges ?? '', softwareStack: softwareStack ?? '', initialized: true },
     });
 
-    pushFeedEvent('ceo_assistant', 'Onboarding Complete', `Digital headquarters fully established. Day Zero briefings loaded.`, 'success');
+    // Ensure executives are provisioned
+    const { OrganizationService } = await import('./src/services/auth/index.js');
+    await OrganizationService.provisionNewOrganization(org.id);
 
-    // Populate active status for other components
-    agents.forEach((a) => {
-      a.status = 'Active';
-      a.lastAction = 'Operational loops verified. Listening for CEO directives.';
+    // Resolve Atlas (CEO Assistant) executive
+    const atlasExec = await prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Atlas' } } });
+    if (!atlasExec) return res.status(500).json({ error: 'CEO Assistant not provisioned.' });
+
+    const { CEOAssistant } = await import('./src/services/executives/index.js');
+    const atlas = new CEOAssistant(org.id, atlasExec.id);
+    const briefing = await atlas.generateDayZeroBriefing(org);
+
+    // Wake all executives
+    await prisma.aIExecutive.updateMany({
+      where: { organizationId: org.id },
+      data: { status: 'ACTIVE', lastAction: 'Operational loops verified. Standing by for directives.' },
     });
 
-    res.json({ success: true, context: orgContext, briefing: dayZeroBriefing });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    res.json({ success: true, context: org, briefing });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/v1/onboarding/context', (req, res) => {
-  res.json({ context: orgContext, briefing: dayZeroBriefing });
+app.get('/api/v1/onboarding/context', async (_req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.json({ context: { initialized: false }, briefing: null });
+    const latestBriefing = await prisma.memory.findFirst({
+      where: { organizationId: org.id, tags: { has: 'onboarding' } },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json({ context: org, briefing: latestBriefing ? { briefing: latestBriefing.text } : null });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-// Workforce Directory & Individual Agent
-app.get('/api/v1/agents', (req, res) => {
-  res.json({ agents });
+// ─── Agents (AI Executives) ───────────────────────────────────────────────────
+
+app.get('/api/v1/agents', async (_req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.json({ agents: [] });
+    const execs = await prisma.aIExecutive.findMany({
+      where: { organizationId: org.id },
+      include: { department: true },
+      orderBy: { name: 'asc' },
+    });
+    res.json({ agents: execs.map(toAgentShape) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/v1/agents/:id', (req, res) => {
-  const agent = agents.find((a) => a.id === req.params.id);
-  if (!agent) return res.status(404).json({ error: 'Agent not found' });
-  res.json(agent);
+app.get('/api/v1/agents/:id', async (req, res) => {
+  try {
+    const exec = await prisma.aIExecutive.findUnique({ where: { id: req.params.id }, include: { department: true } });
+    if (!exec) return res.status(404).json({ error: 'Agent not found' });
+    res.json(toAgentShape(exec));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-// Update Agent State (for simulated behavior)
-app.post('/api/v1/agents/:id/action', (req, res) => {
-  const agent = agents.find((a) => a.id === req.params.id);
-  if (!agent) return res.status(404).json({ error: 'Agent not found' });
+// ─── Decisions ────────────────────────────────────────────────────────────────
 
-  const { status, lastAction } = req.body;
-  if (status) agent.status = status;
-  if (lastAction) agent.lastAction = lastAction;
-
-  pushFeedEvent(agent.id, 'Manual Action', lastAction, 'info');
-  res.json(agent);
+app.get('/api/v1/decisions', async (_req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.json({ decisions: [] });
+    const decisions = await prisma.decision.findMany({
+      where: { organizationId: org.id, status: 'pending' },
+      include: { contributors: { include: { executive: true } }, createdBy: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json({
+      decisions: decisions.map((d) => ({
+        id: d.id,
+        title: d.title,
+        summary: d.summary,
+        description: d.description,
+        reasoning: d.reasoning,
+        impact: d.impact,
+        confidence: d.confidence,
+        status: d.status,
+        type: d.type,
+        contributors: d.contributors.map((c) => c.executiveId),
+        createdAt: d.createdAt.toISOString(),
+      })),
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-// Decisions System
-app.get('/api/v1/decisions', (req, res) => {
-  res.json({ decisions: decisions.filter(d => d.status === 'pending') });
-});
-
-app.get('/api/v1/decisions/history', (req, res) => {
-  res.json({ decisions: decisions.filter(d => d.status !== 'pending') });
+app.get('/api/v1/decisions/history', async (_req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.json({ decisions: [] });
+    const decisions = await prisma.decision.findMany({
+      where: { organizationId: org.id, status: { not: 'pending' } },
+      orderBy: { updatedAt: 'desc' },
+      take: 50,
+    });
+    res.json({ decisions });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/v1/decisions/:id/approve', async (req, res) => {
-  const decision = decisions.find((d) => d.id === req.params.id);
-  if (!decision) return res.status(404).json({ error: 'Decision not found' });
-
-  decision.status = 'approved';
-
-  pushFeedEvent('ceo_assistant', 'Executive Approval', `CEO approved: "${decision.title}"`, 'success');
-
-  // Record Decision to Memory
-  memories.push({
-    id: `mem_dec_${Date.now()}`,
-    text: `Executive Decision Approved:\nTitle: ${decision.title}\nDescription: ${decision.description}\nImpact: ${decision.impact}\nReasoning: ${decision.reasoning}`,
-    type: 'Decision_Record',
-    sourceSystem: 'Security Layer',
-    actor: 'CEO (Human)',
-    createdAt: new Date().toISOString(),
-    tags: ['decision', 'approval', decision.type],
-  });
-
-  // Check if it resolves an active Lead Qualification proposal workflow
-  if (decision.type === 'proposal_approval' && decision.payload) {
-    const leadId = decision.payload.leadId;
-    const proposalId = decision.payload.proposalId;
-
-    const lead = leads.find((l) => l.id === leadId);
-    if (lead) lead.status = 'proposal_sent';
-
-    const prop = proposals.find((p) => p.id === proposalId);
-    if (prop) prop.status = 'sent';
-
-    // Update active workflow index
-    const wf = workflows.find((w) => w.id === 'wf_deal_closed');
-    if (wf) {
-      wf.steps[2].status = 'completed';
-      wf.currentStepIndex = 3;
-      wf.steps[3].status = 'running';
-      wf.updatedAt = new Date().toISOString();
-      broadcastEvent({ type: 'workflow', data: wf });
-
-      // Run step 4 automatically
-      setTimeout(() => {
-        wf.steps[3].status = 'completed';
-        wf.status = 'completed';
-        wf.updatedAt = new Date().toISOString();
-        broadcastEvent({ type: 'workflow', data: wf });
-
-        pushFeedEvent('sales_ai', 'Proposal Delivered', `Deal structured. Proposal emailed to ${lead?.company}.`, 'success');
-
-        memories.push({
-          id: `mem_wf_complete_${Date.now()}`,
-          text: `Workflow Autonomous Lead Conversion completed successfully. Lead: ${lead?.name} (${lead?.company}). Pitch sent. Total calculated value: $${lead?.value}`,
-          type: 'Workflow_Event',
-          sourceSystem: 'Workflow Engine',
-          actor: 'Sales AI',
-          createdAt: new Date().toISOString(),
-          tags: ['workflow', 'completed', 'deal'],
-        });
-      }, 3000);
-    }
-  }
-
-  res.json({ success: true, decision });
-});
-
-app.post('/api/v1/decisions/:id/decline', (req, res) => {
-  const decision = decisions.find((d) => d.id === req.params.id);
-  if (!decision) return res.status(404).json({ error: 'Decision not found' });
-
-  decision.status = 'declined';
-  pushFeedEvent('ceo_assistant', 'Executive Veto', `CEO vetoed: "${decision.title}"`, 'critical');
-
-  memories.push({
-    id: `mem_dec_${Date.now()}`,
-    text: `Executive Decision Vetoed:\nTitle: ${decision.title}\nDescription: ${decision.description}`,
-    type: 'Decision_Record',
-    sourceSystem: 'Security Layer',
-    actor: 'CEO (Human)',
-    createdAt: new Date().toISOString(),
-    tags: ['decision', 'veto', decision.type],
-  });
-
-  if (decision.type === 'proposal_approval' && decision.payload) {
-    const lead = leads.find((l) => l.id === decision.payload.leadId);
-    if (lead) lead.status = 'lost';
-
-    const wf = workflows.find((w) => w.id === 'wf_deal_closed');
-    if (wf) {
-      wf.status = 'failed';
-      wf.steps[2].status = 'failed';
-      wf.updatedAt = new Date().toISOString();
-      broadcastEvent({ type: 'workflow', data: wf });
-    }
-  }
-
-  res.json({ success: true, decision });
-});
-
-// Business Engine: Leads CRUD & CSV Import
-app.get('/api/v1/leads', (req, res) => {
-  res.json({ leads });
-});
-
-app.post('/api/v1/leads', (req, res) => {
-  const { name, company, email, phone, value, source } = req.body;
-  if (!name || !company) return res.status(400).json({ error: 'Name and Company are required' });
-
-  const newLead: Lead = {
-    id: `lead_${Date.now()}`,
-    name,
-    company,
-    email: email || '',
-    phone: phone || '',
-    status: 'new',
-    source: source || 'Manual Entry',
-    value: Number(value) || 0,
-    createdAt: new Date().toISOString(),
-  };
-
-  leads.unshift(newLead);
-  res.json(newLead);
-});
-
-// CSV Import Simulation
-app.post('/api/v1/leads/import', (req, res) => {
-  const { csvText } = req.body;
-  if (!csvText) return res.status(400).json({ error: 'CSV data is empty' });
-
-  const rows = csvText.split('\n');
-  let processed = 0;
-  let created = 0;
-  let skipped = 0;
-  const skipReasons: string[] = [];
-
-  rows.forEach((row: string, index: number) => {
-    if (index === 0 && row.toLowerCase().includes('name')) return; // header row
-    const cols = row.split(',').map((c: string) => c.trim());
-    if (cols.length < 2 || !cols[0]) {
-      if (row.trim()) {
-        skipped++;
-        skipReasons.push(`Row ${index + 1}: Missing name or company`);
-      }
-      return;
-    }
-
-    processed++;
-    created++;
-    leads.unshift({
-      id: `lead_csv_${Date.now()}_${index}`,
-      name: cols[0],
-      company: cols[1] || 'Unknown Corp',
-      email: cols[2] || '',
-      phone: cols[3] || '',
-      status: 'new',
-      source: 'CSV Upload',
-      value: Number(cols[4]) || 12000,
-      createdAt: new Date().toISOString(),
+  try {
+    const decision = await prisma.decision.findUnique({
+      where: { id: req.params.id },
+      include: { createdBy: true },
     });
-  });
+    if (!decision) return res.status(404).json({ error: 'Decision not found' });
 
-  pushFeedEvent('sales_ai', 'CSV Import Complete', `Processed ${processed} leads successfully. ${created} imported, ${skipped} skipped.`, 'success');
+    await prisma.decision.update({
+      where: { id: req.params.id },
+      data: { status: 'approved', approvedAt: new Date(), updatedAt: new Date() },
+    });
 
-  res.json({
-    processed,
-    created,
-    skipped,
-    reasons: skipReasons,
-  });
+    // Memory record
+    await prisma.memory.create({
+      data: {
+        organizationId: decision.organizationId,
+        executiveId: decision.createdByExecutiveId,
+        text: `Decision Approved: "${decision.title}". Impact: ${decision.impact ?? 'N/A'}. Reasoning: ${decision.reasoning}`,
+        type: 'decision',
+        actor: 'CEO (Human)',
+        sourceSystem: 'Executive Office',
+        tags: ['decision', 'approved'],
+        updatedAt: new Date(),
+      },
+    });
+
+    // Feed event
+    await prisma.feedEvent.create({
+      data: {
+        organizationId: decision.organizationId,
+        executiveId: decision.createdByExecutiveId,
+        action: 'Decision Approved',
+        text: `CEO approved: "${decision.title}"`,
+        status: 'success',
+      },
+    });
+    broadcastEvent({ type: 'decision_approved', data: { id: decision.id } });
+
+    // If financial decision — advance linked lead to proposal_sent
+    if (decision.metadata && (decision.metadata as any).leadId) {
+      const leadId = (decision.metadata as any).leadId;
+      const proposalId = (decision.metadata as any).proposalId;
+      await prisma.lead.update({ where: { id: leadId }, data: { status: 'proposal_sent', updatedAt: new Date() } });
+      if (proposalId) {
+        await prisma.proposal.update({ where: { id: proposalId }, data: { status: 'sent', sentAt: new Date(), updatedAt: new Date() } });
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-// Trigger Lead Qualification Flow (Requirements 16 - Vertical Slice)
+app.post('/api/v1/decisions/:id/decline', async (req, res) => {
+  try {
+    const decision = await prisma.decision.findUnique({ where: { id: req.params.id } });
+    if (!decision) return res.status(404).json({ error: 'Decision not found' });
+
+    const { reason } = req.body;
+    await prisma.decision.update({
+      where: { id: req.params.id },
+      data: { status: 'declined', declinedAt: new Date(), declineReason: reason ?? null, updatedAt: new Date() },
+    });
+
+    await prisma.feedEvent.create({
+      data: {
+        organizationId: decision.organizationId,
+        executiveId: decision.createdByExecutiveId,
+        action: 'Decision Declined',
+        text: `CEO declined: "${decision.title}"${reason ? ` — ${reason}` : ''}`,
+        status: 'warning',
+      },
+    });
+    broadcastEvent({ type: 'decision_declined', data: { id: decision.id } });
+
+    res.json({ success: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Leads ────────────────────────────────────────────────────────────────────
+
+app.get('/api/v1/leads', async (_req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.json({ leads: [] });
+    const leads = await prisma.lead.findMany({
+      where: { organizationId: org.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json({
+      leads: leads.map((l) => ({
+        id: l.id, name: l.name, company: l.company, email: l.email, phone: l.phone,
+        status: l.status, source: l.source, value: l.value,
+        score: l.qualificationScore, reasoning: l.qualificationReasoning,
+        createdAt: l.createdAt.toISOString(),
+      })),
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/v1/leads', async (req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
+    const { name, company, email, phone, value, source } = req.body;
+    if (!name || !email) return res.status(400).json({ error: 'Name and email are required.' });
+    const lead = await prisma.lead.create({
+      data: {
+        organizationId: org.id, name, company: company ?? null, email,
+        phone: phone ?? null, value: Number(value) || 0,
+        source: source ?? 'inbound_webform', updatedAt: new Date(),
+      },
+    });
+    res.json(lead);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/v1/leads/import', async (req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
+    const { csvText } = req.body;
+    if (!csvText) return res.status(400).json({ error: 'CSV data is empty.' });
+
+    const rows = csvText.split('\n');
+    let created = 0; let skipped = 0;
+    const reasons: string[] = [];
+
+    for (const [i, row] of rows.entries()) {
+      if (i === 0 && row.toLowerCase().includes('name')) continue; // header
+      const cols = row.split(',').map((c: string) => c.trim());
+      if (!cols[0] || !cols[1]) { skipped++; reasons.push(`Row ${i + 1}: missing name/company`); continue; }
+      await prisma.lead.create({
+        data: {
+          organizationId: org.id, name: cols[0], company: cols[1],
+          email: cols[2] ?? `unknown-${Date.now()}@import.local`,
+          phone: cols[3] ?? null, value: Number(cols[4]) || 12000,
+          source: 'inbound_webform', updatedAt: new Date(),
+        },
+      });
+      created++;
+    }
+
+    // Feed event via Zephyr
+    const zephyr = await prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Zephyr' } } });
+    if (zephyr) {
+      await prisma.feedEvent.create({
+        data: { organizationId: org.id, executiveId: zephyr.id, action: 'CSV Import Complete', text: `${created} leads imported, ${skipped} skipped.`, status: 'success' },
+      });
+      broadcastEvent({ type: 'feed', data: { agentName: zephyr.name, action: 'CSV Import Complete', text: `${created} leads imported.` } });
+    }
+    res.json({ processed: created + skipped, created, skipped, reasons });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Lead Qualification Flow ──────────────────────────────────────────────────
+// Sales AI (Zephyr) qualifies → Finance AI (Aurelia) drafts proposal → Decision filed
+
 app.post('/api/v1/leads/:id/qualify', async (req, res) => {
-  const lead = leads.find((l) => l.id === req.params.id);
-  if (!lead) return res.status(404).json({ error: 'Lead not found' });
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
 
-  lead.status = 'qualifying';
+    const lead = await prisma.lead.findFirst({ where: { id: req.params.id, organizationId: org.id } });
+    if (!lead) return res.status(404).json({ error: 'Lead not found.' });
 
-  // Wake up Sales AI
-  const sales = agents.find((a) => a.id === 'sales_ai');
-  if (sales) {
-    sales.status = 'In Process';
-    sales.lastAction = `Qualifying lead: ${lead.name} from ${lead.company}`;
-  }
+    const [zephyrExec, aureliaExec] = await Promise.all([
+      prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Zephyr' } } }),
+      prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Aurelia' } } }),
+    ]);
+    if (!zephyrExec || !aureliaExec) return res.status(500).json({ error: 'Sales AI or Finance AI not provisioned.' });
 
-  // Reset/Trigger Workflow
-  const wf = workflows.find((w) => w.id === 'wf_deal_closed');
-  if (wf) {
-    wf.status = 'running';
-    wf.currentStepIndex = 0;
-    wf.steps.forEach((s) => (s.status = 'pending'));
-    wf.steps[0].status = 'running';
-    wf.updatedAt = new Date().toISOString();
+    const { SalesAI, FinanceAI } = await import('./src/services/executives/index.js');
+    const zephyr = new SalesAI(org.id, zephyrExec.id);
+    const aurelia = new FinanceAI(org.id, aureliaExec.id);
+
+    // Step 1: Zephyr qualifies the lead
+    const { lead: qualifiedLead, qualification } = await zephyr.qualifyLead(lead.id);
+
+    if (qualification.score < 50) {
+      // Disqualified — no proposal needed
+      return res.json({ success: true, lead: qualifiedLead, qualification, proposal: null, decisionId: null });
+    }
+
+    // Step 2: Aurelia drafts the proposal
+    const proposal = await aurelia.draftProposal(lead.id, qualification.estimatedValue);
+
+    // Step 3: Zephyr files a decision for CEO approval
+    const decision = await zephyr.createSalesDecision(lead.id, proposal.id, qualification.estimatedValue);
+
+    res.json({
+      success: true,
+      lead: {
+        id: qualifiedLead.id, name: qualifiedLead.name, company: qualifiedLead.company,
+        status: qualifiedLead.status, score: qualifiedLead.qualificationScore,
+        reasoning: qualifiedLead.qualificationReasoning, value: qualifiedLead.estimatedValue,
+      },
+      qualification,
+      proposal: { id: proposal.id, totalValue: proposal.totalValue, lineItems: proposal.lineItems },
+      decisionId: decision.id,
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Proposals ────────────────────────────────────────────────────────────────
+
+app.get('/api/v1/proposals', async (_req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.json({ proposals: [] });
+    const proposals = await prisma.proposal.findMany({
+      where: { organizationId: org.id },
+      include: { lineItems: { orderBy: { order: 'asc' } }, lead: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json({
+      proposals: proposals.map((p) => ({
+        id: p.id, leadId: p.leadId, customerName: p.lead.name,
+        companyName: p.lead.company, title: p.title, content: p.content,
+        total: p.totalValue, status: p.status,
+        items: p.lineItems.map((i) => ({ id: i.id, description: i.description, quantity: i.quantity, price: i.price })),
+        createdAt: p.createdAt.toISOString(),
+      })),
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Memories ────────────────────────────────────────────────────────────────
+
+app.get('/api/v1/memories', async (_req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.json({ memories: [] });
+    const memories = await prisma.memory.findMany({
+      where: { organizationId: org.id },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+    res.json({
+      memories: memories.map((m) => ({
+        id: m.id, text: m.text, type: m.type,
+        sourceSystem: m.sourceSystem ?? 'Atlas OS',
+        actor: m.actor ?? 'System',
+        createdAt: m.createdAt.toISOString(), tags: m.tags,
+      })),
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/v1/memories', async (req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
+    const { text, type, actor, sourceSystem, tags } = req.body;
+    if (!text) return res.status(400).json({ error: 'Text is required.' });
+    const memory = await prisma.memory.create({
+      data: {
+        organizationId: org.id, text,
+        type: type ?? 'other', actor: actor ?? 'Human',
+        sourceSystem: sourceSystem ?? 'Manual Entry',
+        tags: tags ?? [], updatedAt: new Date(),
+      },
+    });
+    res.json(memory);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/v1/memories/search', async (req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.json({ results: [] });
+    const { query, type } = req.body;
+    if (!query) return res.status(400).json({ error: 'Query required.' });
+    const memories = await prisma.memory.findMany({
+      where: {
+        organizationId: org.id,
+        ...(type ? { type } : {}),
+        text: { contains: query, mode: 'insensitive' },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+    });
+    res.json({ results: memories });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Feeds ────────────────────────────────────────────────────────────────────
+
+app.get('/api/v1/feeds', async (_req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.json({ feeds: [] });
+    const feeds = await prisma.feedEvent.findMany({
+      where: { organizationId: org.id },
+      include: { executive: true },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+    res.json({
+      feeds: feeds.map((f) => ({
+        id: f.id, agentId: f.executiveId, agentName: f.executive.name,
+        department: f.executive.role, action: f.action, text: f.text,
+        timestamp: f.createdAt.toISOString(), status: f.status,
+      })),
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Workflows ────────────────────────────────────────────────────────────────
+
+app.get('/api/v1/workflows', async (_req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.json({ workflows: [] });
+    const workflows = await prisma.workflow.findMany({
+      where: { organizationId: org.id },
+      include: { steps: { orderBy: { order: 'asc' }, include: { actorExecutive: true } } },
+      orderBy: { updatedAt: 'desc' },
+      take: 20,
+    });
+    res.json({
+      workflows: workflows.map((w) => ({
+        id: w.id, name: w.name, status: w.status.toLowerCase(),
+        currentStepIndex: w.currentStepIndex, triggerEvent: w.triggerEvent,
+        updatedAt: w.updatedAt.toISOString(),
+        steps: w.steps.map((s) => ({
+          name: s.name, status: s.status.toLowerCase(),
+          actorId: s.actorExecutiveId, actionDescription: s.actionDescription,
+        })),
+      })),
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/v1/workflows/:id/start', async (req, res) => {
+  try {
+    const wf = await prisma.workflow.update({
+      where: { id: req.params.id },
+      data: { status: 'active', startedAt: new Date(), updatedAt: new Date() },
+    });
     broadcastEvent({ type: 'workflow', data: wf });
-  }
+    res.json({ success: true, workflow: wf });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
 
-  pushFeedEvent('sales_ai', 'Qualifying Lead', `Beginning deep profile fit for ${lead.company}...`, 'info');
+// ─── Strategy Session ─────────────────────────────────────────────────────────
 
-  // Step 1: Sales AI qualification with Gemini
-  const evaluation = await qualifyLeadWithGemini(lead, orgContext);
-  lead.score = evaluation.score;
-  lead.reasoning = evaluation.reasoning;
-  lead.value = evaluation.estimatedValue;
-  lead.status = 'qualified';
+app.post('/api/v1/strategy-session', async (req, res) => {
+  try {
+    const { topic, threadHistory } = req.body;
+    if (!topic) return res.status(400).json({ error: 'Topic is required.' });
 
-  // Record Sales AI Assessment in memory
-  memories.push({
-    id: `mem_sales_assess_${Date.now()}`,
-    text: `Lead Qualification Assessment for ${lead.company}:\nScore: ${evaluation.score}/100\nReasoning: ${evaluation.reasoning}\nTarget Value: $${evaluation.estimatedValue}\nNext Step: ${evaluation.recommendedAction}`,
-    type: 'Customer_Interaction',
-    sourceSystem: 'Sales Intelligence',
-    actor: 'Sales AI',
-    createdAt: new Date().toISOString(),
-    tags: ['qualification', 'sales', lead.id],
-  });
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
 
-  pushFeedEvent('sales_ai', 'Lead Qualified', `Qualified lead: ${lead.company}. Score: ${evaluation.score}/100. Commercial potential: $${evaluation.estimatedValue.toLocaleString()}.`, 'success');
+    const atlasExec = await prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Atlas' } } });
+    if (!atlasExec) return res.status(500).json({ error: 'CEO Assistant not provisioned.' });
 
-  if (sales) {
-    sales.status = 'Idle';
-    sales.lastAction = `Qualified lead ${lead.company}. Ready for billing draft.`;
-  }
+    const { CEOAssistant } = await import('./src/services/executives/index.js');
+    const atlas = new CEOAssistant(org.id, atlasExec.id);
 
-  // Update Workflow to Step 2
-  if (wf) {
-    wf.steps[0].status = 'completed';
-    wf.steps[1].status = 'running';
-    wf.currentStepIndex = 1;
-    wf.updatedAt = new Date().toISOString();
-    broadcastEvent({ type: 'workflow', data: wf });
-  }
+    const result = await atlas.runStrategySession(topic, threadHistory ?? []);
+    res.json(result);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
 
-  // Step 2: Finance AI drafts proposal with Gemini
-  const finance = agents.find((a) => a.id === 'finance_ai');
-  if (finance) {
-    finance.status = 'In Process';
-    finance.lastAction = `Drafting commercial proposal and invoice terms for ${lead.company}`;
-  }
+// ─── Command Center ───────────────────────────────────────────────────────────
 
-  pushFeedEvent('finance_ai', 'Drafting Commercials', `Compiling invoicing items for $${evaluation.estimatedValue.toLocaleString()}...`, 'info');
+app.post('/api/v1/command-center', async (req, res) => {
+  try {
+    const { command } = req.body;
+    if (!command) return res.status(400).json({ error: 'Command is required.' });
 
-  const draft = await draftProposalWithGemini(lead, evaluation.score, evaluation.reasoning, evaluation.estimatedValue, orgContext);
-  const proposalId = `prop_${Date.now()}`;
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
 
-  const newProposal: Proposal = {
-    id: proposalId,
-    leadId: lead.id,
-    customerName: lead.name,
-    companyName: lead.company,
-    items: draft.lineItems.map((item: any, idx: number) => ({
-      id: `item_${idx}`,
-      description: item.description,
-      quantity: item.quantity,
-      price: item.price,
-    })),
-    total: evaluation.estimatedValue,
-    status: 'draft',
-    createdAt: new Date().toISOString(),
-    content: draft.content,
-  };
+    const atlasExec = await prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Atlas' } } });
+    if (!atlasExec) return res.status(500).json({ error: 'CEO Assistant not provisioned.' });
 
-  proposals.unshift(newProposal);
-  lead.status = 'proposal_drafted';
+    const { CEOAssistant } = await import('./src/services/executives/index.js');
+    const atlas = new CEOAssistant(org.id, atlasExec.id);
 
-  // Save proposal to memory
-  memories.push({
-    id: `mem_prop_draft_${Date.now()}`,
-    text: `Proposal Draft Compiled for ${lead.company}:\n\n${draft.content}`,
-    type: 'Document',
-    sourceSystem: 'Finance Intelligence',
-    actor: 'Finance AI',
-    createdAt: new Date().toISOString(),
-    tags: ['proposal', 'billing', lead.id],
-  });
+    const result = await atlas.processCommand(command);
+    res.json(result);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
 
-  pushFeedEvent('finance_ai', 'Proposal Compiled', `Commercial agreement and custom invoices ready for review.`, 'success');
+// ─── Boardroom Report ─────────────────────────────────────────────────────────
 
-  if (finance) {
-    finance.status = 'Idle';
-    finance.lastAction = `Finished draft for ${lead.company}. Waiting on CEO approval.`;
-  }
+app.get('/api/v1/boardroom/report', async (_req, res) => {
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
 
-  // Update Workflow to Step 3 (CEO Approval)
-  if (wf) {
-    wf.steps[1].status = 'completed';
-    wf.steps[2].status = 'running';
-    wf.currentStepIndex = 2;
-    wf.status = 'paused';
-    wf.updatedAt = new Date().toISOString();
-    broadcastEvent({ type: 'workflow', data: wf });
-  }
+    const atlasExec = await prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Atlas' } } });
+    if (!atlasExec) return res.status(500).json({ error: 'CEO Assistant not provisioned.' });
 
-  // Create Decision Requiring Approval
-  const decId = `dec_prop_${Date.now()}`;
-  decisions.unshift({
-    id: decId,
-    title: `Approve Proposal: ${lead.company} ($${evaluation.estimatedValue.toLocaleString()})`,
-    summary: `Sales AI and Finance AI have compiled a qualified deal structure for ${lead.name} from ${lead.company}.`,
-    description: `The deal score is evaluated at ${evaluation.score}/100. Sales reasoning: "${evaluation.reasoning}". Finance AI structured ${draft.lineItems.length} billing items summing up to the commercial valuation of $${evaluation.estimatedValue.toLocaleString()}.`,
-    reasoning: `Proposed terms structure high-probability margins. This deal converts directly to Q3 metrics.`,
-    impact: `Strategic ARR contribution of $${evaluation.estimatedValue.toLocaleString()} with standard operations delivery costs of ~20%.`,
-    confidence: evaluation.score,
-    status: 'pending',
-    contributors: ['sales_ai', 'finance_ai'],
-    type: 'proposal_approval',
-    createdAt: new Date().toISOString(),
-    payload: {
-      leadId: lead.id,
-      proposalId,
-      decisionId: decId,
+    const { CEOAssistant } = await import('./src/services/executives/index.js');
+    const atlas = new CEOAssistant(org.id, atlasExec.id);
+
+    const result = await atlas.generateBoardReport();
+    res.json(result);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/v1/boardroom/export', (_req, res) => {
+  setTimeout(() => {
+    res.json({ success: true, downloadLink: 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf' });
+  }, 800);
+});
+
+// ─── Audit Routes ─────────────────────────────────────────────────────────────
+
+app.get('/api/v1/audit/summary', async (req, res) => {
+  try {
+    const { AuditLog } = await import('./src/infrastructure/audit/AuditLog.js');
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const orgId = org?.id ?? 'default';
+    const [summary, totals] = await Promise.all([AuditLog.dailySummary(orgId), AuditLog.totals()]);
+    res.json({ summary, totals, checkedAt: new Date().toISOString() });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/v1/audit/recent', async (req, res) => {
+  try {
+    const { AuditLog } = await import('./src/infrastructure/audit/AuditLog.js');
+    const limit = Math.min(parseInt((req.query.limit as string) ?? '100', 10), 500);
+    // Prefer cache; fall back to DB on cold start
+    const cached = AuditLog.recent(limit);
+    const entries = cached.length > 0 ? cached : await AuditLog.recentFromDb(limit);
+    res.json({ entries, checkedAt: new Date().toISOString() });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/v1/audit/executive/:id', async (req, res) => {
+  try {
+    const { AuditLog } = await import('./src/infrastructure/audit/AuditLog.js');
+    const limit = Math.min(parseInt((req.query.limit as string) ?? '50', 10), 200);
+    res.json({ entries: AuditLog.forExecutive(req.params.id, limit), checkedAt: new Date().toISOString() });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SEED — Provision demo data on first boot so Mission Control isn't empty
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function seedDemoData(orgId: string) {
+  const [leadCount, memCount] = await Promise.all([
+    prisma.lead.count({ where: { organizationId: orgId } }),
+    prisma.memory.count({ where: { organizationId: orgId } }),
+  ]);
+
+  // Only seed if completely empty
+  if (leadCount > 0) return;
+
+  const zephyr = await prisma.aIExecutive.findFirst({ where: { organizationId: orgId, name: { contains: 'Zephyr' } } });
+  const aurelia = await prisma.aIExecutive.findFirst({ where: { organizationId: orgId, name: { contains: 'Aurelia' } } });
+  const atlas = await prisma.aIExecutive.findFirst({ where: { organizationId: orgId, name: { contains: 'Atlas' } } });
+  if (!zephyr || !aurelia || !atlas) return;
+
+  // Seed 3 starter leads
+  const [lead1, lead2, lead3] = await Promise.all([
+    prisma.lead.create({ data: { organizationId: orgId, name: 'Thabo Ndlovu', company: 'Silo Technologies', email: 'thabo@silotech.co.za', phone: '+27 82 123 4567', value: 28000, source: 'inbound_webform', updatedAt: new Date() } }),
+    prisma.lead.create({ data: { organizationId: orgId, name: 'Sarah Chen', company: 'Nexus Dynamics', email: 'sarah@nexusdyn.com', phone: '+1 415 555 0193', value: 55000, source: 'referral', updatedAt: new Date() } }),
+    prisma.lead.create({ data: { organizationId: orgId, name: 'Marcus Weber', company: 'Alpine Solutions', email: 'm.weber@alpinesol.de', phone: '+49 89 555 0142', value: 18000, source: 'inbound_webform', updatedAt: new Date() } }),
+  ]);
+
+  // Seed a pre-qualified lead with a draft proposal and pending decision
+  await prisma.lead.update({ where: { id: lead2.id }, data: { status: 'qualified', qualificationScore: 88, qualificationReasoning: 'Strong enterprise fit — Nexus Dynamics operates in our core vertical with confirmed budget.', estimatedValue: 55000, recommendedAction: 'Proceed to proposal stage.', qualifiedAt: new Date(), qualifiedBy: 'Zephyr (Sales AI)', assignedToExecutiveId: zephyr.id, updatedAt: new Date() } });
+
+  const proposal = await prisma.proposal.create({
+    data: {
+      organizationId: orgId, leadId: lead2.id, createdByExecutiveId: aurelia.id,
+      title: 'Commercial Proposal — Nexus Dynamics', content: '# Atlas OS Commercial Proposal\n\n**Prepared for:** Nexus Dynamics\n**Contact:** Sarah Chen\n\n## Executive Summary\nWe propose a full Atlas OS Enterprise deployment covering Sales, Finance, and Customer Success automation.\n\n## Deliverables\n- Atlas OS Enterprise License (12 months)\n- Professional Implementation & Configuration\n- Training & Onboarding Package\n\n## Commercial Terms\nTotal investment: **$55,000**',
+      totalValue: 55000, status: 'draft', expiresAt: new Date(Date.now() + 30 * 24 * 3600 * 1000), updatedAt: new Date(),
+      lineItems: { create: [
+        { description: 'Atlas OS Enterprise License (Annual)', quantity: 1, price: 27500, total: 27500, order: 0 },
+        { description: 'Professional Implementation', quantity: 1, price: 16500, total: 16500, order: 1 },
+        { description: 'Training & Onboarding', quantity: 1, price: 11000, total: 11000, order: 2 },
+      ]},
     },
   });
 
-  pushFeedEvent('ceo_assistant', 'Executive Decision Filed', `Decision filed: Please review commercial proposal for ${lead.company}.`, 'warning');
+  await prisma.lead.update({ where: { id: lead2.id }, data: { status: 'proposal_drafted', updatedAt: new Date() } });
 
-  res.json({
-    success: true,
-    lead,
-    proposal: newProposal,
-    decisionId: decId,
-  });
-});
-
-// Proposals list
-app.get('/api/v1/proposals', (req, res) => {
-  res.json({ proposals });
-});
-
-// Memory Console Search (Full-Text & Simulated Semantic search)
-app.get('/api/v1/memories', (req, res) => {
-  res.json({ memories });
-});
-
-// In-Memory Search combining textual and Gemini-grounded matching
-app.post('/api/v1/memories/search', async (req, res) => {
-  const { query, type } = req.body;
-  if (!query) return res.status(400).json({ error: 'Search query is required' });
-
-  let filtered = memories;
-  if (type) filtered = filtered.filter((m) => m.type === type);
-
-  // Score each memory by relevance (basic textual scoring)
-  const queryWords = query.toLowerCase().split(/\s+/).filter(Boolean);
-
-  const scored = filtered.map((mem) => {
-    let score = 0;
-    const textLower = mem.text.toLowerCase();
-    const tagMatch = mem.tags.some((t) => query.toLowerCase().includes(t.toLowerCase()));
-
-    if (tagMatch) score += 40;
-
-    queryWords.forEach((word: string) => {
-      if (textLower.includes(word)) score += 20;
-    });
-
-    // Add extra score for exact word matching
-    return {
-      ...mem,
-      relevanceScore: Math.min(100, Math.max(10, score)),
-    };
+  await prisma.decision.create({
+    data: {
+      organizationId: orgId, createdByExecutiveId: zephyr.id, title: 'Approve Deal: Sarah Chen at Nexus Dynamics',
+      summary: 'Zephyr has qualified Sarah Chen (Nexus Dynamics) with score 88/100. Aurelia has drafted a $55,000 proposal.',
+      description: 'Strong enterprise fit — confirmed budget, active evaluation, aligned on vertical.',
+      reasoning: 'Lead shows strong enterprise fit with confirmed budget authority. High conversion probability.',
+      impact: 'Potential revenue: $55,000 ARR. Recommended: Proceed to proposal send.',
+      confidence: 88, type: 'financial', status: 'pending',
+      expiresAt: new Date(Date.now() + 72 * 3600 * 1000),
+      metadata: { leadId: lead2.id, proposalId: proposal.id, dealValue: 55000 },
+      updatedAt: new Date(),
+      contributors: { create: [{ executiveId: aurelia.id }] },
+    },
   });
 
-  // Sort by highest score first
-  const results = scored.sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0));
-
-  res.json({ results: results.slice(0, 10) });
-});
-
-// Feeds Event History
-app.get('/api/v1/feeds', (req, res) => {
-  res.json({ feeds });
-});
-
-// Workflows list
-app.get('/api/v1/workflows', (req, res) => {
-  res.json({ workflows });
-});
-
-// Strategy Session Multi-Agent Orchestration Endpoint (Requirement 12)
-app.post('/api/v1/strategy-session', async (req, res) => {
-  const { topic, selectedAgents, threadHistory } = req.body;
-
-  if (!topic) return res.status(400).json({ error: 'Strategic topic is required' });
-
-  const activeParticipants = selectedAgents || ['finance_ai', 'sales_ai', 'marketing_ai'];
-
-  if (!hasGeminiKey) {
-    // Return standard synthetic conversation responses
-    const speakerId = activeParticipants[Math.floor(Math.random() * activeParticipants.length)];
-    const agent = agents.find((a) => a.id === speakerId);
-    return res.json({
-      speakerId,
-      messageText: `[Local Mode - Offline] As ${agent?.name || 'an executive agent'}, I have reviewed the topic "${topic}". I propose setting up structured timelines, analyzing current constraints, and deploying specialized automation to handle immediate bottlenecks.`,
-      isSynthesis: false,
-    });
+  // Seed mission memory
+  if (memCount === 0) {
+    await prisma.memory.create({ data: { organizationId: orgId, executiveId: atlas.id, text: 'Company Mission: Atlas OS creates absolute administrative efficiency where AI executive agents handle operations while humans retain strategic control.', type: 'policy', actor: 'CEO', sourceSystem: 'Internal Wiki', tags: ['mission', 'governance', 'charter'], updatedAt: new Date() } });
+    await prisma.memory.create({ data: { organizationId: orgId, executiveId: zephyr.id, text: 'ICP Definition: B2B companies with 10-200 employees, in technology or services sectors, with annual revenue $1M+, experiencing operational scaling challenges.', type: 'insight', actor: 'Zephyr (Sales AI)', sourceSystem: 'Sales Intelligence', tags: ['icp', 'sales', 'targeting'], updatedAt: new Date() } });
   }
 
-  try {
-    const threadPrompt = (threadHistory || []).map((msg: any) => `${msg.role === 'user' ? 'Human CEO' : msg.speakerName}: ${msg.content}`).join('\n');
+  // Seed boot feed events
+  await prisma.feedEvent.create({ data: { organizationId: orgId, executiveId: atlas.id, action: 'System Initialized', text: 'Atlas OS Executive Team is online. All 10 AI executives provisioned and standing by.', status: 'success' } });
+  await prisma.feedEvent.create({ data: { organizationId: orgId, executiveId: zephyr.id, action: 'Pipeline Loaded', text: `3 inbound leads loaded. ${lead2.company} flagged as high-priority (Score: 88/100).`, status: 'info' } });
+  await prisma.feedEvent.create({ data: { organizationId: orgId, executiveId: aurelia.id, action: 'Proposal Drafted', text: `$55,000 commercial proposal drafted for ${lead2.company}. Awaiting CEO approval.`, status: 'success' } });
 
-    const prompt = `You are orchestrating a strategic corporate Strategy Session for Atlas OS.
-    Human CEO wants strategic alignment on this topic: "${topic}".
-    Participating AI Executives: ${activeParticipants.map((id: string) => agents.find((a) => a.id === id)?.name).join(', ')}.
+  console.log('[Atlas] Demo data seeded: 3 leads, 1 proposal, 1 decision, 2 memories, 3 feed events.');
+}
 
-    Thread History so far:
-    ${threadPrompt}
+// ═══════════════════════════════════════════════════════════════════════════════
+// SERVER BOOT
+// ═══════════════════════════════════════════════════════════════════════════════
 
-    Task:
-    Choose the single most appropriate agent from the participants who should speak next to advance the conversation, or if the conversation has reached a mature strategic checkpoint, have the "CEO Assistant (Atlas)" perform the strategic synthesis and output a formal recommendation.
-    
-    If an AI Executive is speaking next, provide their response.
-    If the CEO Assistant is synthesizing, output "ceo_assistant" as speakerId, check isSynthesis to true, and compile a clear strategic recommendation containing:
-    1. A single powerful recommendation statement.
-    2. A checklist of actions.
-    3. Operational constraints.
-
-    Ensure output conforms to the JSON schema. Keep responses authoritative, professional, and dense with commercial insights.`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            speakerId: { type: Type.STRING, description: "Agent ID speaking next. Must be one of: 'finance_ai', 'sales_ai', 'marketing_ai', or 'ceo_assistant'" },
-            messageText: { type: Type.STRING, description: 'Core speech response' },
-            isSynthesis: { type: Type.BOOLEAN, description: 'True if conversation is fully summarized by the CEO Assistant with a concrete recommendation' },
-            recommendation: {
-              type: Type.OBJECT,
-              properties: {
-                statement: { type: Type.STRING, description: 'Synthesized proposal' },
-                actions: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Checklist of strategic tasks' },
-                constraints: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Target constraints/budget ceilings' },
-              },
-            },
-          },
-          required: ['speakerId', 'messageText', 'isSynthesis'],
-        },
-      },
-    });
-
-    const parsed = JSON.parse(response.text || '{}');
-
-    // Record Strategy Session to Memory
-    memories.push({
-      id: `mem_strat_${Date.now()}`,
-      text: `Strategy Session Interaction on "${topic}":\nSpeaker: ${parsed.speakerId}\nContent: ${parsed.messageText}`,
-      type: 'Strategy_Session',
-      sourceSystem: 'Central Intelligence Office',
-      actor: parsed.speakerId,
-      createdAt: new Date().toISOString(),
-      tags: ['strategy', 'collaboration', topic.replace(/\s+/g, '_').toLowerCase()],
-    });
-
-    res.json(parsed);
-  } catch (error: any) {
-    console.error('Gemini error in strategy session:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Command Center Overlay NLP Processor (Requirement 13)
-app.post('/api/v1/command-center', async (req, res) => {
-  const { command } = req.body;
-  if (!command) return res.status(400).json({ error: 'Command text is required' });
-
-  pushFeedEvent('ceo_assistant', 'Command Center Query', `Processing voice/NLP command: "${command}"`, 'info');
-
-  if (!hasGeminiKey) {
-    return res.json({
-      text: `Received command "${command}". Here is a summary of actions:
-      - We can navigate you directly to your Sales Dashboard, Finance Ledger, or Central Memory.
-      - Standard operational parameters are currently nominal.`,
-      navigationTarget: null,
-    });
-  }
-
-  try {
-    const prompt = `You are the Command Center processor for Atlas OS (CEO Assistant).
-    The CEO entered this natural language command: "${command}"
-
-    Task:
-    Evaluate the command. Give a direct, concise executive feedback summary. If the command expresses a clear desire to navigate or perform a specific workflow, return one of these strict navigation routes as navigationTarget:
-    - "/dashboard" (Mission Control / dashboard / overview)
-    - "/sales" (Sales Center / qualified deals / CRM)
-    - "/finance" (Finance Department / ledger / invoicing)
-    - "/marketing" (Marketing Studio / Aria / campaigns)
-    - "/memory" (Central Intelligence / memory search / log history)
-    - "/pulse" (Organization Pulse / workflow map)
-    - "/boardroom" (Boardroom Mode)
-    - "/workforce" (Workforce Directory)
-    Otherwise, return null for navigationTarget.
-
-    Return your output strictly as a JSON object matching the schema.`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            text: { type: Type.STRING, description: 'Concise, professional executive feedback' },
-            navigationTarget: { type: Type.STRING, description: 'Optional route target' },
-          },
-          required: ['text'],
-        },
-      },
-    });
-
-    res.json(JSON.parse(response.text || '{}'));
-  } catch (error: any) {
-    res.json({
-      text: `Command received. Direct processing failed, routed command to CEO assistant offline queue.`,
-      navigationTarget: null,
-    });
-  }
-});
-
-// Boardroom Slide deck Compiler & PDF Mock exporter (Requirement 15)
-app.get('/api/v1/boardroom/report', async (req, res) => {
-  if (!hasGeminiKey) {
-    return res.json({
-      markdownReport: `# Atlas OS - Board Briefing\n\n## 1. Executive Operations\n- System status: NOMINAL\n- Operational targets: ACTIVE\n\n## 2. Strategic Objectives\n- Cost containment and margin safety implemented\n- Inbound pipeline scoring fully qualified\n\n## 3. Department Financial Metrics\n- ARR Forecast: $418,000\n- High Confidence deals: 3`,
-    });
-  }
-
-  try {
-    const prompt = `Generate a cinematic, high-impact Board Presentation Report summarizing the active Atlas OS operations.
-    Company: ${orgContext.name || 'Atlas Operations'}
-    Industry: ${orgContext.industry}
-    Goals: ${orgContext.goals}
-
-    Compile a deep-dive, professional report in beautiful Markdown format covering Q3 strategic opportunities, AI workforce productivity, and commercial growth. Focus on executive clarity and precision.`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: prompt,
-    });
-
-    res.json({ markdownReport: response.text });
-  } catch (error) {
-    res.json({
-      markdownReport: `# Atlas Board Report\n\nCompilation occurred with local backup files. Operational status is steady.`,
-    });
-  }
-});
-
-app.post('/api/v1/boardroom/export', (req, res) => {
-  // Simulates PDF file generation and return within 15 seconds (Returns instant success mock link)
-  setTimeout(() => {
-    res.json({
-      success: true,
-      downloadLink: 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf',
-    });
-  }, 1000);
-});
-
-// -----------------------------------------------------------------------------
-// Vite and Production Asset Handlers
-// -----------------------------------------------------------------------------
 async function startServer() {
+  // 1. Start Atlas Execution Engine (Redis + BullMQ + Workers)
+  let engineStarted = false;
+  try {
+    const { executionEngine } = await import('./src/infrastructure/ExecutionEngine.js');
+    await executionEngine.start();
+    engineStarted = true;
+  } catch (err: any) {
+    console.warn(`[Atlas] Execution Engine offline: ${err.message}. Set REDIS_URL to enable workers.`);
+  }
+
+  // 2. Seed demo data for initialized organizations
+  try {
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    if (org) await seedDemoData(org.id);
+  } catch (err: any) {
+    console.warn(`[Atlas] Demo seed skipped: ${err.message}`);
+  }
+
+  // 3. Wire ExecutionBridge (event bus handlers + cross-executive messaging)
+  try {
+    executionBridge.initialize();
+    console.log('[Atlas] ExecutionBridge initialized ✓');
+  } catch (err: any) {
+    console.warn(`[Atlas] ExecutionBridge init failed: ${err.message}`);
+  }
+
+  // 4. Start Scheduler (autonomous executive cron jobs)
+  try {
+    schedulerService.start();
+    console.log('[Atlas] Scheduler started ✓');
+  } catch (err: any) {
+    console.warn(`[Atlas] Scheduler start failed: ${err.message}`);
+  }
+
+  // 3. Vite dev server / static production
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Atlas OS Gateway running on http://0.0.0.0:${PORT}`);
+    const hasKey = !!(process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || process.env.DEEPSEEK_API_KEY);
+    console.log(`\n🚀 Atlas OS running → http://0.0.0.0:${PORT}`);
+    console.log(`   AI Provider : ${(process.env.AI_PROVIDER || 'openrouter').toUpperCase()}`);
+    console.log(`   AI Key      : ${hasKey ? 'CONFIGURED ✓' : 'NOT SET — using local fallbacks'}`);
+    console.log(`   Exec Engine : ${engineStarted ? 'RUNNING ✓' : 'OFFLINE (Redis not configured)'}`);
+    console.log(`   Scheduler   : ${schedulerService.isRunning() ? 'RUNNING ✓' : 'OFFLINE'}`);
+    console.log(`   Event Bus   : ${executionBridge.isInitialized() ? 'WIRED ✓' : 'OFFLINE'}`);
+    console.log(`   Database    : Neon PostgreSQL (Prisma)\n`);
+    console.log(`   Executive Routes:`);
+    console.log(`     /api/v1/executives/atlas/*    — CEO Assistant`);
+    console.log(`     /api/v1/executives/zephyr/*   — Sales AI`);
+    console.log(`     /api/v1/executives/aurelia/*  — Finance AI`);
+    console.log(`     /api/v1/executives/aria/*     — Marketing AI`);
+    console.log(`     /api/v1/executives/lyra/*     — Customer Success AI`);
+    console.log(`     /api/v1/executives/sage/*     — HR AI`);
+    console.log(`     /api/v1/executives/orion/*    — Operations AI`);
+    console.log(`     /api/v1/executives/lexis/*    — Legal AI`);
+    console.log(`     /api/v1/executives/forge/*    — Developer AI`);
+    console.log(`     /api/v1/executives/iris/*     — Intelligence AI`);
+    console.log(`\n   Integration Routes:`);
+    console.log(`     GET  /api/integrations                   — List all integrations`);
+    console.log(`     GET  /api/integrations/:provider/connect — Get OAuth URL`);
+    console.log(`     GET  /api/integrations/:provider/callback— OAuth callback`);
+    console.log(`     POST /api/integrations/:provider/sync    — Trigger sync`);
+    console.log(`\n   Collaboration Routes:`);
+    console.log(`     POST /api/v1/collaboration/ask           — Exec asks exec`);
+    console.log(`     POST /api/v1/collaboration/convene       — Multi-exec session`);
+    console.log(`     POST /api/v1/collaboration/delegate      — Delegate a task`);
+    console.log(`     POST /api/v1/collaboration/brief         — Intel briefing`);
+    console.log(`     POST /api/v1/collaboration/workflow/:name— Autonomous workflow`);
+    console.log(`       workflows: deal_review, full_lead_cycle, weekly_board_prep,`);
+    console.log(`                  incident_response, expansion_analysis,`);
+    console.log(`                  churn_intervention, first_client`);
+    console.log(`     GET  /api/v1/collaboration/sessions      — Session history`);
+    console.log(`\n   Governance Routes:`);
+    console.log(`     GET  /api/v1/governance/status           — Current mode + pending`);
+    console.log(`     GET  /api/v1/governance/policy           — Full policy table`);
+    console.log(`     POST /api/v1/governance/atlas/run        — Atlas acts as CEO`);
+    console.log(`     GET  /api/v1/governance/log              — Audit log`);
+    console.log(`\n   Mission Goals & Outbound:`);
+    console.log(`     POST /api/v1/goals                       — Set CEO mission goal`);
+    console.log(`     GET  /api/v1/goals                       — Active goals + milestones`);
+    console.log(`     POST /api/v1/outbound/campaign           — Launch outbound campaign`);
+    console.log(`\n   Scheduler Routes:`);
+    console.log(`     POST /api/v1/scheduler/trigger/:event    — Manually fire schedule`);
+    console.log(`     GET  /api/v1/scheduler/status            — Scheduler status\n`);
   });
 }
 

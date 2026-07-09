@@ -1,7 +1,11 @@
 /**
- * @license
- * SPDX-License-Identifier: Apache-2.0
+ * Atlas OS — Frontend Types
+ *
+ * These types match exactly what the API returns from the database-backed
+ * server. Field names align with the Prisma models mapped through server.ts.
  */
+
+// ─── Agent (AI Executive) ─────────────────────────────────────────────────────
 
 export interface Agent {
   id: string;
@@ -17,19 +21,18 @@ export interface Agent {
   metrics: {
     tasksCompleted: number;
     decisionsMade: number;
-    valueGenerated: number; // in USD or ZAR
+    valueGenerated: number;
   };
 }
 
+// ─── Memory ───────────────────────────────────────────────────────────────────
+
+// DB stores lowercase; keep the union permissive with a string fallback
 export type MemoryType =
-  | 'Meeting_Transcript'
-  | 'Decision_Record'
-  | 'Email_Thread'
-  | 'Document'
-  | 'Chat_Message'
-  | 'Customer_Interaction'
-  | 'Workflow_Event'
-  | 'Strategy_Session';
+  | 'document' | 'conversation' | 'decision' | 'insight' | 'policy' | 'workflow' | 'other'
+  // Legacy uppercase values (still accepted by MemoryConsole)
+  | 'Meeting_Transcript' | 'Decision_Record' | 'Email_Thread' | 'Document'
+  | 'Chat_Message' | 'Customer_Interaction' | 'Workflow_Event' | 'Strategy_Session';
 
 export interface MemoryEntry {
   id: string;
@@ -39,8 +42,10 @@ export interface MemoryEntry {
   actor: string;
   createdAt: string;
   tags: string[];
-  relevanceScore?: number; // for semantic search
+  relevanceScore?: number;
 }
+
+// ─── Decision ─────────────────────────────────────────────────────────────────
 
 export interface Decision {
   id: string;
@@ -48,14 +53,16 @@ export interface Decision {
   summary: string;
   description: string;
   reasoning: string;
-  impact: string; // e.g. "Generates $42,000 ARR, improves margins by 4%"
-  confidence: number; // 0 - 100
-  status: 'pending' | 'approved' | 'declined';
-  contributors: string[]; // agent IDs
-  type: 'lead_qualification' | 'proposal_approval' | 'payroll' | 'general';
+  impact: string;
+  confidence: number; // 0-100
+  status: 'pending' | 'approved' | 'declined' | 'expired';
+  // contributors is an array of executive IDs (DB returns string[])
+  contributors: string[];
+  type: string;
   createdAt: string;
-  payload?: any; // internal data (like lead ID, invoice details, etc.)
 }
+
+// ─── Feed Event ───────────────────────────────────────────────────────────────
 
 export interface FeedEvent {
   id: string;
@@ -68,19 +75,24 @@ export interface FeedEvent {
   status: 'success' | 'warning' | 'info' | 'critical';
 }
 
+// ─── Lead ─────────────────────────────────────────────────────────────────────
+
 export interface Lead {
   id: string;
   name: string;
-  company: string;
+  company: string | null;
   email: string;
-  phone: string;
-  status: 'new' | 'qualifying' | 'qualified' | 'unqualified' | 'proposal_drafted' | 'proposal_sent' | 'lost';
+  phone: string | null;
+  status: 'new' | 'qualifying' | 'qualified' | 'unqualified' | 'proposal_drafted' | 'proposal_sent' | 'closed_won' | 'closed_lost' | 'disqualified' | 'lost';
   source: string;
   value: number;
-  score?: number; // 0 - 100
-  reasoning?: string;
+  // Qualification fields — present after Zephyr runs
+  score?: number | null;
+  reasoning?: string | null;
   createdAt: string;
 }
+
+// ─── Proposal ─────────────────────────────────────────────────────────────────
 
 export interface InvoiceItem {
   id: string;
@@ -93,37 +105,42 @@ export interface Proposal {
   id: string;
   leadId: string;
   customerName: string;
-  companyName: string;
+  companyName: string | null;
   items: InvoiceItem[];
   total: number;
-  status: 'draft' | 'approved' | 'sent' | 'paid';
+  status: 'draft' | 'approved' | 'sent' | 'viewed' | 'accepted' | 'declined' | 'expired' | 'paid';
   createdAt: string;
-  content: string; // Markdown or detailed text description of proposal
+  content: string;
 }
+
+// ─── Workflow ─────────────────────────────────────────────────────────────────
 
 export interface WorkflowStep {
   name: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  actorId?: string; // agent ID or "CEO"
-  actionDescription: string;
+  status: 'pending' | 'running' | 'in_progress' | 'completed' | 'failed' | 'skipped';
+  actorId?: string | null;
+  actionDescription: string | null;
 }
 
 export interface Workflow {
   id: string;
   name: string;
-  status: 'running' | 'paused' | 'completed' | 'failed';
+  status: 'running' | 'active' | 'paused' | 'completed' | 'failed' | 'cancelled';
   steps: WorkflowStep[];
   currentStepIndex: number;
-  triggerEvent: string;
+  triggerEvent: string | null;
   updatedAt: string;
 }
 
+// ─── Organization Context ─────────────────────────────────────────────────────
+
 export interface OrganizationContext {
+  id?: string;
   name: string;
-  industry: string;
-  size: string;
-  goals: string;
-  challenges: string;
-  softwareStack: string;
+  industry: string | null;
+  size: string | null;
+  goals: string | null;
+  challenges: string | null;
+  softwareStack: string | null;
   initialized: boolean;
 }

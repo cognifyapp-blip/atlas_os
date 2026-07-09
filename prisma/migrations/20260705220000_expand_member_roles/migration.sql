@@ -1,0 +1,6 @@
+-- Expand MemberRole enum to match Clerk's full role set for Atlas OS
+-- Adds: EXECUTIVE, MANAGER, EMPLOYEE
+
+ALTER TYPE "MemberRole" ADD VALUE IF NOT EXISTS 'EXECUTIVE';
+ALTER TYPE "MemberRole" ADD VALUE IF NOT EXISTS 'MANAGER';
+ALTER TYPE "MemberRole" ADD VALUE IF NOT EXISTS 'EMPLOYEE';

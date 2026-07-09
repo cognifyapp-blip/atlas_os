@@ -1,0 +1,702 @@
+// Atlas OS - Prisma Schema
+// Foundation models only. Additional tables are added incrementally.
+// See: https://www.prisma.io/docs/concepts/components/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────
+// IDENTITY LAYER
+// ─────────────────────────────────────────────
+
+model User {
+  id             String       @id @default(cuid())
+  /** Clerk user_xxx ID — null until Clerk webhook fires */
+  externalId     String?      @unique
+  email          String       @unique
+  name           String?
+  avatarUrl      String?
+  passwordHash   String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  memberships      Membership[]
+  approvedDecisions Decision[] @relation("ApprovedDecisions")
+  declinedDecisions Decision[] @relation("DeclinedDecisions")
+
+  @@map("users")
+}
+
+model Organization {
+  id             String       @id @default(cuid())
+  /** Clerk org_xxx ID — null for orgs created before Clerk was set up */
+  externalId     String?      @unique
+  name           String
+  industry       String?
+  size           String?
+  goals          String?
+  challenges     String?
+  softwareStack  String?
+  initialized    Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  memberships    Membership[]
+  departments    Department[]
+  aiExecutives   AIExecutive[]
+  integrations   Integration[]
+  leads          Lead[]
+  decisions      Decision[]
+  proposals      Proposal[]
+  memories       Memory[]
+  workflows      Workflow[]
+  feedEvents     FeedEvent[]
+  tasks          Task[]
+  missionGoals   MissionGoal[]
+
+  @@map("organizations")
+}
+
+model Membership {
+  id             String       @id @default(cuid())
+  role           MemberRole   @default(MEMBER)
+  joinedAt       DateTime     @default(now())
+
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@map("memberships")
+}
+
+enum MemberRole {
+  OWNER
+  ADMIN
+  EXECUTIVE
+  MANAGER
+  EMPLOYEE
+  MEMBER
+  VIEWER
+}
+
+// ─────────────────────────────────────────────
+// OPERATIONAL LAYER
+// ─────────────────────────────────────────────
+
+model Department {
+  id             String       @id @default(cuid())
+  name           String
+  description    String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  aiExecutives   AIExecutive[]
+
+  @@map("departments")
+}
+
+model AIExecutive {
+  id             String          @id @default(cuid())
+  name           String
+  role           String
+  bio            String?
+  avatarUrl      String?
+  status         ExecutiveStatus @default(IDLE)
+  lastAction     String?
+  goals          String[]
+  tools          String[]
+  tasksCompleted Int             @default(0)
+  decisionsMade  Int             @default(0)
+  valueGenerated Float           @default(0)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  organizationId String
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  departmentId   String?
+  department     Department?     @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+
+  // Operational relations
+  assignedLeads        Lead[]              @relation("AssignedLeads")
+  createdDecisions     Decision[]          @relation("CreatedDecisions")
+  decisionContribs     DecisionContributor[]
+  createdProposals     Proposal[]          @relation("CreatedProposals")
+  memories             Memory[]
+  createdTasks         Task[]              @relation("CreatedTasks")
+  assignedTasks        Task[]              @relation("AssignedTasks")
+  workflowSteps        WorkflowStep[]
+  feedEvents           FeedEvent[]
+  ownedMilestones      GoalMilestone[]     @relation("OwnedMilestones")
+
+  @@map("ai_executives")
+}
+
+// ─────────────────────────────────────────────
+// OPERATIONAL LAYER
+// ─────────────────────────────────────────────
+
+enum LeadStatus {
+  new
+  qualified
+  proposal_drafted
+  proposal_sent
+  closed_won
+  closed_lost
+  disqualified
+}
+
+model Lead {
+  id                     String      @id @default(cuid())
+  organizationId         String
+  organization           Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name                   String
+  company                String?
+  email                  String
+  phone                  String?
+  status                 LeadStatus  @default(new)
+  source                 String      @default("inbound_webform")
+  value                  Float       @default(0)
+  qualificationScore     Int?
+  qualificationReasoning String?
+  estimatedValue         Float?
+  recommendedAction      String?
+  assignedToExecutiveId  String?
+  assignedTo             AIExecutive? @relation("AssignedLeads", fields: [assignedToExecutiveId], references: [id], onDelete: SetNull)
+  qualifiedAt            DateTime?
+  qualifiedBy            String?
+  metadata               Json?
+  proposals              Proposal[]
+  tasks                  Task[]
+  createdAt              DateTime    @default(now())
+  updatedAt              DateTime    @updatedAt
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([assignedToExecutiveId])
+  @@index([createdAt(sort: Desc)])
+  @@map("leads")
+}
+
+enum DecisionStatus {
+  pending
+  approved
+  declined
+  expired
+}
+
+enum DecisionType {
+  general
+  financial
+  strategic
+  operational
+  legal
+  hr
+}
+
+model Decision {
+  id                   String          @id @default(cuid())
+  organizationId       String
+  organization         Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  title                String
+  summary              String
+  description          String?
+  reasoning            String
+  impact               String?
+  confidence           Int             @default(50)
+  status               DecisionStatus  @default(pending)
+  type                 DecisionType    @default(general)
+  createdByExecutiveId String
+  createdBy            AIExecutive     @relation("CreatedDecisions", fields: [createdByExecutiveId], references: [id], onDelete: Cascade)
+  contributors         DecisionContributor[]
+  approvedByUserId     String?
+  approvedBy           User?           @relation("ApprovedDecisions", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  approvedAt           DateTime?
+  declinedByUserId     String?
+  declinedBy           User?           @relation("DeclinedDecisions", fields: [declinedByUserId], references: [id], onDelete: SetNull)
+  declinedAt           DateTime?
+  declineReason        String?
+  expiresAt            DateTime?
+  metadata             Json?
+  proposals            Proposal[]
+  tasks                Task[]
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([createdByExecutiveId])
+  @@index([createdAt(sort: Desc)])
+  @@map("decisions")
+}
+
+model DecisionContributor {
+  id           String      @id @default(cuid())
+  decisionId   String
+  decision     Decision    @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+  executiveId  String
+  executive    AIExecutive @relation(fields: [executiveId], references: [id], onDelete: Cascade)
+  contribution String?
+  createdAt    DateTime    @default(now())
+
+  @@unique([decisionId, executiveId])
+  @@map("decision_contributors")
+}
+
+enum ProposalStatus {
+  draft
+  sent
+  viewed
+  accepted
+  declined
+  expired
+}
+
+model Proposal {
+  id                   String         @id @default(cuid())
+  organizationId       String
+  organization         Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  leadId               String
+  lead                 Lead           @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  decisionId           String?
+  decision             Decision?      @relation(fields: [decisionId], references: [id], onDelete: SetNull)
+  title                String
+  content              String
+  totalValue           Float          @default(0)
+  status               ProposalStatus @default(draft)
+  createdByExecutiveId String
+  createdBy            AIExecutive    @relation("CreatedProposals", fields: [createdByExecutiveId], references: [id], onDelete: Cascade)
+  lineItems            ProposalLineItem[]
+  sentAt               DateTime?
+  viewedAt             DateTime?
+  acceptedAt           DateTime?
+  declinedAt           DateTime?
+  expiresAt            DateTime?
+  metadata             Json?
+  tasks                Task[]
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  @@index([organizationId])
+  @@index([leadId])
+  @@index([status])
+  @@map("proposals")
+}
+
+model ProposalLineItem {
+  id          String   @id @default(cuid())
+  proposalId  String
+  proposal    Proposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  description String
+  quantity    Float    @default(1)
+  price       Float
+  total       Float
+  order       Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  @@index([proposalId])
+  @@map("proposal_line_items")
+}
+
+enum MemoryType {
+  document
+  conversation
+  decision
+  insight
+  policy
+  workflow
+  other
+}
+
+model Memory {
+  id             String      @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  text           String
+  type           MemoryType  @default(other)
+  sourceSystem   String?
+  actor          String?
+  executiveId    String?
+  executive      AIExecutive? @relation(fields: [executiveId], references: [id], onDelete: SetNull)
+  tags           String[]
+  metadata       Json?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@index([organizationId])
+  @@index([type])
+  @@index([executiveId])
+  @@index([createdAt(sort: Desc)])
+  @@map("memories")
+}
+
+enum WorkflowStatus {
+  paused
+  active
+  completed
+  failed
+  cancelled
+}
+
+enum WorkflowStepStatus {
+  pending
+  in_progress
+  completed
+  failed
+  skipped
+}
+
+model Workflow {
+  id               String         @id @default(cuid())
+  organizationId   String
+  organization     Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name             String
+  description      String?
+  status           WorkflowStatus @default(paused)
+  currentStepIndex Int            @default(0)
+  triggerEvent     String?
+  metadata         Json?
+  steps            WorkflowStep[]
+  tasks            Task[]
+  startedAt        DateTime?
+  completedAt      DateTime?
+  failedAt         DateTime?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@index([organizationId])
+  @@index([status])
+  @@map("workflows")
+}
+
+model WorkflowStep {
+  id                String             @id @default(cuid())
+  workflowId        String
+  workflow          Workflow           @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  name              String
+  actionDescription String?
+  status            WorkflowStepStatus @default(pending)
+  order             Int
+  actorExecutiveId  String?
+  actorExecutive    AIExecutive?       @relation(fields: [actorExecutiveId], references: [id], onDelete: SetNull)
+  startedAt         DateTime?
+  completedAt       DateTime?
+  failedAt          DateTime?
+  error             String?
+  output            Json?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  @@index([workflowId])
+  @@index([status])
+  @@map("workflow_steps")
+}
+
+enum FeedEventStatus {
+  info
+  success
+  warning
+  critical
+}
+
+model FeedEvent {
+  id             String          @id @default(cuid())
+  organizationId String
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  executiveId    String
+  executive      AIExecutive     @relation(fields: [executiveId], references: [id], onDelete: Cascade)
+  action         String
+  text           String
+  status         FeedEventStatus @default(info)
+  metadata       Json?
+  createdAt      DateTime        @default(now())
+
+  @@index([organizationId])
+  @@index([executiveId])
+  @@index([createdAt(sort: Desc)])
+  @@map("feed_events")
+}
+
+enum TaskStatus {
+  todo
+  in_progress
+  blocked
+  completed
+  cancelled
+}
+
+enum TaskPriority {
+  low
+  medium
+  high
+  urgent
+}
+
+model Task {
+  id                    String      @id @default(cuid())
+  organizationId        String
+  organization          Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  title                 String
+  description           String?
+  status                TaskStatus  @default(todo)
+  priority              TaskPriority @default(medium)
+  assignedToExecutiveId String
+  assignedTo            AIExecutive @relation("AssignedTasks", fields: [assignedToExecutiveId], references: [id], onDelete: Cascade)
+  createdByExecutiveId  String?
+  createdBy             AIExecutive? @relation("CreatedTasks", fields: [createdByExecutiveId], references: [id], onDelete: SetNull)
+  leadId                String?
+  lead                  Lead?       @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  proposalId            String?
+  proposal              Proposal?   @relation(fields: [proposalId], references: [id], onDelete: SetNull)
+  decisionId            String?
+  decision              Decision?   @relation(fields: [decisionId], references: [id], onDelete: SetNull)
+  workflowId            String?
+  workflow              Workflow?   @relation(fields: [workflowId], references: [id], onDelete: SetNull)
+  dueDate               DateTime?
+  completedAt           DateTime?
+  metadata              Json?
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([assignedToExecutiveId])
+  @@index([dueDate])
+  @@map("tasks")
+}
+
+enum ExecutiveStatus {
+  IDLE
+  ACTIVE
+  BUSY
+  OFFLINE
+}
+
+// ─────────────────────────────────────────────
+// INTEGRATION LAYER
+// ─────────────────────────────────────────────
+
+enum IntegrationStatus {
+  CONNECTED
+  DISCONNECTED
+  ERROR
+  PENDING
+  EXPIRED
+}
+
+enum SyncMode {
+  INITIAL
+  INCREMENTAL
+  FULL
+}
+
+model Integration {
+  id             String            @id @default(cuid())
+  provider       String
+  displayName    String
+  status         IntegrationStatus @default(PENDING)
+  connectedAt    DateTime?
+  disconnectedAt DateTime?
+  lastSyncAt     DateTime?
+  errorMessage   String?
+  metadata       Json?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  organizationId String
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  oauthToken     OAuthToken?
+  syncHistory    SyncHistory[]
+  webhookEvents  WebhookEvent[]
+
+  @@unique([organizationId, provider])
+  @@index([organizationId])
+  @@index([provider])
+  @@map("integrations")
+}
+
+model OAuthToken {
+  id           String    @id @default(cuid())
+  accessToken  String
+  refreshToken String?
+  expiresAt    DateTime?
+  scopes       String[]
+  tokenType    String    @default("Bearer")
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  integrationId  String  @unique
+  integration    Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  organizationId String
+
+  @@unique([integrationId, organizationId])
+  @@map("oauth_tokens")
+}
+
+model SyncHistory {
+  id               String   @id @default(cuid())
+  provider         String
+  mode             SyncMode
+  entityType       String?
+  recordsProcessed Int      @default(0)
+  recordsCreated   Int      @default(0)
+  recordsUpdated   Int      @default(0)
+  recordsSkipped   Int      @default(0)
+  errors           String[]
+  nextCursor       String?
+  durationMs       Int      @default(0)
+  completedAt      DateTime @default(now())
+
+  integrationId  String
+  integration    Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  organizationId String
+
+  @@index([integrationId])
+  @@index([organizationId])
+  @@index([completedAt(sort: Desc)])
+  @@map("sync_history")
+}
+
+model WebhookEvent {
+  id            String    @id @default(cuid())
+  provider      String
+  eventType     String
+  rawPayload    Json
+  processed     Boolean   @default(false)
+  processedAt   DateTime?
+  correlationId String?
+  error         String?
+  receivedAt    DateTime  @default(now())
+
+  integrationId  String?
+  integration    Integration? @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+  organizationId String
+
+  @@index([organizationId])
+  @@index([provider])
+  @@index([processed])
+  @@index([receivedAt(sort: Desc)])
+  @@map("webhook_events")
+}
+
+
+// ─────────────────────────────────────────────
+// MISSION GOALS LAYER
+// ─────────────────────────────────────────────
+
+enum GoalStatus {
+  active
+  completed
+  paused
+  cancelled
+}
+
+enum MilestoneStatus {
+  pending
+  in_progress
+  completed
+  missed
+  blocked
+}
+
+model MissionGoal {
+  id               String      @id @default(cuid())
+  organizationId   String
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  title            String
+  description      String?
+  targetDate       DateTime?
+  status           GoalStatus  @default(active)
+  /// 0-100 overall progress
+  progress         Int         @default(0)
+  successCriteria  String?
+  /// true = set by human CEO, false = generated by Atlas
+  setByHuman       Boolean     @default(true)
+  metadata         Json?
+  milestones       GoalMilestone[]
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  @@index([organizationId])
+  @@index([status])
+  @@map("mission_goals")
+}
+
+model GoalMilestone {
+  id               String          @id @default(cuid())
+  goalId           String
+  goal             MissionGoal     @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  organizationId   String
+  week             Int
+  title            String
+  description      String?
+  ownerExecutiveId String?
+  owner            AIExecutive?    @relation("OwnedMilestones", fields: [ownerExecutiveId], references: [id], onDelete: SetNull)
+  status           MilestoneStatus @default(pending)
+  dueDate          DateTime?
+  completedAt      DateTime?
+  notes            String?
+  metadata         Json?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@index([goalId])
+  @@index([ownerExecutiveId])
+  @@map("goal_milestones")
+}
+
+
+// ─────────────────────────────────────────────
+// EXECUTION AUDIT LAYER
+// ─────────────────────────────────────────────
+
+enum AuditStatus {
+  queued
+  started
+  completed
+  failed
+  retrying
+}
+
+model AuditLogEntry {
+  id             String      @id @default(cuid())
+  /// ISO timestamp when the entry was created
+  ts             DateTime    @default(now())
+  organizationId String
+  userId         String      @default("system")
+  correlationId  String
+  jobId          String?
+  jobName        String
+  queue          String
+  worker         String
+  executiveId    String?
+  executiveName  String?
+  status         AuditStatus @default(queued)
+  startedAt      DateTime?
+  completedAt    DateTime?
+  durationMs     Int?
+  retryCount     Int         @default(0)
+  error          String?
+  tokensUsed     Int?
+  costUsd        Float?
+  context        Json?
+
+  @@index([organizationId])
+  @@index([correlationId])
+  @@index([executiveId])
+  @@index([status])
+  @@index([ts(sort: Desc)])
+  @@map("audit_log_entries")
+}

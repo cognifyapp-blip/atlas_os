@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { LayoutDashboard, BrainCircuit, Activity, Users, DollarSign, Target, Megaphone, Library, Presentation, ChevronRight, Sparkles } from 'lucide-react';
+import { LayoutDashboard, BrainCircuit, Activity, Users, DollarSign, Target, Megaphone, Library, Presentation, Sparkles, GitMerge, Shield, Crosshair } from 'lucide-react';
 
 interface SidebarProps {
   currentView: string;
@@ -15,12 +15,15 @@ interface SidebarProps {
 export default function Sidebar({ currentView, onNavigate, pendingDecisionsCount, orgName }: SidebarProps) {
   const menuItems = [
     { id: 'dashboard', name: 'Mission Control', icon: LayoutDashboard },
-    { id: 'strategy', name: 'Strategy Session', icon: BrainCircuit, highlight: true },
+    { id: 'goals', name: 'Mission Goals', icon: Crosshair, highlight: true },
+    { id: 'strategy', name: 'Strategy Session', icon: BrainCircuit },
     { id: 'pulse', name: 'Organization Pulse', icon: Activity },
     { id: 'workforce', name: 'AI Workforce', icon: Users },
     { id: 'finance', name: 'Finance Ledger', icon: DollarSign },
     { id: 'sales', name: 'Sales Pipeline', icon: Target },
     { id: 'marketing', name: 'Marketing Studio', icon: Megaphone },
+    { id: 'collaboration', name: 'Collaboration', icon: GitMerge },
+    { id: 'governance', name: 'Governance', icon: Shield },
     { id: 'memory', name: 'Central Memory', icon: Library },
     { id: 'boardroom', name: 'Boardroom Mode', icon: Presentation },
   ];

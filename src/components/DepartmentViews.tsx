@@ -64,8 +64,11 @@ export default function DepartmentViews({
   // 1. SALES COMMAND CENTER VIEW
   // -----------------------------------------------------------------------------
   const renderSalesView = () => {
-    const activeWorkflow = workflows.find((w) => w.id === 'wf_deal_closed');
-    const salesAgent = agents.find((a) => a.id === 'sales_ai');
+    // Find the most recently active lead-conversion workflow (any active/running one)
+    const activeWorkflow = workflows.find((w) =>
+      (w.status === 'running' || w.status === 'active') &&
+      w.steps && w.steps.length > 0
+    );
 
     return (
       <div className="space-y-6">
@@ -132,7 +135,7 @@ export default function DepartmentViews({
         )}
 
         {/* Lead Qualification Workflow Pulse indicator */}
-        {activeWorkflow && activeWorkflow.status === 'running' && (
+        {activeWorkflow && (activeWorkflow.status === 'running' || activeWorkflow.status === 'active') && (
           <div className="p-5 bg-amber-50/50 border border-amber-100 rounded-2xl space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-2">
@@ -146,12 +149,13 @@ export default function DepartmentViews({
             <div className="grid grid-cols-4 gap-2">
               {activeWorkflow.steps.map((step, idx) => {
                 const isCurrent = idx === activeWorkflow.currentStepIndex;
-                const isDone = idx < activeWorkflow.currentStepIndex;
+                const isDone = step.status === 'completed';
+                const isActive = step.status === 'in_progress' || step.status === 'running';
                 return (
                   <div key={idx} className="space-y-1">
                     <div
                       className={`h-1.5 rounded-full transition-all ${
-                        isCurrent ? 'bg-brand-bronze pulsing-glow' : isDone ? 'bg-emerald-600' : 'bg-gray-100'
+                        isActive || isCurrent ? 'bg-brand-bronze pulsing-glow' : isDone ? 'bg-emerald-600' : 'bg-gray-100'
                       }`}
                     />
                     <p className="text-[9px] font-semibold text-gray-600 leading-tight">{step.name}</p>

@@ -14,7 +14,12 @@ import CommandCenter from './components/CommandCenter';
 import Boardroom from './components/Boardroom';
 import DepartmentViews from './components/DepartmentViews';
 import MemoryConsole from './components/MemoryConsole';
+import InfrastructureDashboard from './components/InfrastructureDashboard';
+import ExecutionAudit from './components/ExecutionAudit';
 import { LayoutDashboard, Users, Clock, AlertCircle, Play, Check, X, Shield, RefreshCw } from 'lucide-react';
+import CollaborationView from './components/CollaborationView';
+import GovernancePanel from './components/GovernancePanel';
+import MissionGoalsView from './components/MissionGoalsView';
 
 export default function App() {
   // Navigation & Screen Router
@@ -26,11 +31,11 @@ export default function App() {
   // Corporate Entities State
   const [orgContext, setOrgContext] = useState<OrganizationContext>({
     name: '',
-    industry: '',
-    size: '',
-    goals: '',
-    challenges: '',
-    softwareStack: '',
+    industry: null,
+    size: null,
+    goals: null,
+    challenges: null,
+    softwareStack: null,
     initialized: false,
   });
 
@@ -104,6 +109,11 @@ export default function App() {
           setFeeds((prev) => [payload.data, ...prev.slice(0, 99)]);
         } else if (payload.type === 'workflow') {
           setWorkflows((prev) => prev.map((w) => (w.id === payload.data.id ? payload.data : w)));
+        } else if (payload.type === 'decision' || payload.type === 'decision_governance' || payload.type === 'decision_approved' || payload.type === 'decision_declined') {
+          // Re-fetch decisions so the queue and badges stay current
+          fetch('/api/v1/decisions')
+            .then((r) => r.json())
+            .then((d) => setDecisions(d.decisions ?? []));
         }
       } catch (err) {
         console.error('SSE decoding error:', err);
@@ -223,6 +233,12 @@ export default function App() {
     if (actionKey === 'report') {
       setCurrentView('boardroom');
       setBoardroomActive(true);
+    } else if (actionKey === 'goals' || actionKey === 'first_client') {
+      setCurrentView('goals');
+    } else if (actionKey === 'collaboration') {
+      setCurrentView('collaboration');
+    } else if (actionKey === 'governance') {
+      setCurrentView('governance');
     }
   };
 
@@ -230,24 +246,50 @@ export default function App() {
   // Render Dashboard Home (Mission Control) View
   // -----------------------------------------------------------------------------
   const renderDashboardView = () => {
-    const totalRevenue = leads.filter((l) => l.status === 'proposal_sent').reduce((acc, curr) => acc + curr.value, 0) + 184000;
-    const activePipeline = leads.filter((l) => l.status === 'new' || l.status === 'proposal_drafted').reduce((acc, curr) => acc + curr.value, 0);
+    const totalRevenue = leads
+      .filter((l) => l.status === 'closed_won' || l.status === 'proposal_sent')
+      .reduce((acc, curr) => acc + curr.value, 0);
+    const activePipeline = leads
+      .filter((l) => l.status === 'new' || l.status === 'qualified' || l.status === 'proposal_drafted')
+      .reduce((acc, curr) => acc + curr.value, 0);
 
     return (
       <div className="space-y-6">
         {/* Dynamic Executive Briefing Block */}
         <div className="bg-white border border-gray-100 rounded-2xl p-6 shadow-sm space-y-4">
-          <div className="flex items-center space-x-2 text-brand-bronze">
-            <Shield className="w-5 h-5 pulsing-glow rounded-md" />
-            <span className="text-[10px] font-mono font-bold uppercase tracking-widest">Active Executive Briefing</span>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2 text-brand-bronze">
+              <Shield className="w-5 h-5 pulsing-glow rounded-md" />
+              <span className="text-[10px] font-mono font-bold uppercase tracking-widest">Active Executive Briefing</span>
+            </div>
+            <button
+              onClick={() => setCurrentView('goals')}
+              className="text-[10px] font-mono text-brand-bronze hover:text-black transition-colors font-semibold"
+            >
+              Mission Goals →
+            </button>
           </div>
           <div className="text-xs text-gray-600 leading-relaxed font-sans space-y-2">
             {briefing?.briefing ? (
               <div className="whitespace-pre-wrap">{briefing.briefing}</div>
+            ) : briefing?.text ? (
+              <div className="whitespace-pre-wrap">{briefing.text}</div>
             ) : (
               <p>Welcome to Atlas OS. Finance AI has optimized invoice queues, Sales AI has qualified pipeline assets, and Central Memory holds our historical mission briefings. We are standing by for your strategic approvals.</p>
             )}
           </div>
+          {leads.length === 0 && (
+            <div className="pt-2 border-t border-gray-50 flex items-center justify-between">
+              <p className="text-[11px] text-gray-400">No leads yet. Ready to launch first client campaign?</p>
+              <button
+                onClick={() => setCurrentView('goals')}
+                className="flex items-center space-x-1.5 px-3 py-1.5 bg-black text-white rounded-lg text-[10px] font-semibold hover:bg-black/90 transition-colors"
+              >
+                <span>🚀</span>
+                <span>Launch Campaign</span>
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Tactical Opportunity cards */}
@@ -328,6 +370,12 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        {/* Infrastructure Dashboard */}
+        <InfrastructureDashboard />
+
+        {/* Execution Audit Trail */}
+        <ExecutionAudit />
       </div>
     );
   };
@@ -425,7 +473,7 @@ export default function App() {
           <div className="flex items-center space-x-3 text-xs text-gray-500 font-medium">
             <span>SECURE GATEWAY PORT: 3000</span>
             <span className="text-gray-300">|</span>
-            <span className="font-mono text-[10px] text-brand-bronze uppercase font-bold tracking-widest">{orgContext.name} WORKSPACE</span>
+            <span className="font-mono text-[10px] text-brand-bronze uppercase font-bold tracking-widest">{orgContext.name || 'ATLAS'} WORKSPACE</span>
           </div>
 
           <button
@@ -458,6 +506,9 @@ export default function App() {
             />
           )}
           {currentView === 'memory' && <MemoryConsole memories={memories} />}
+          {currentView === 'collaboration' && <CollaborationView />}
+          {currentView === 'governance' && <GovernancePanel />}
+          {currentView === 'goals' && <MissionGoalsView />}
         </main>
       </div>
 
