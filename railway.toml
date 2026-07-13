@@ -4,7 +4,7 @@ buildCommand = "npx prisma generate && npm run build"
 
 [deploy]
 startCommand = "npm run start"
-healthcheckPath = "/api/v1/scheduler/status"
+healthcheckPath = "/api/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3

@@ -74,6 +74,11 @@ import governanceRouter from './src/routes/governance.js';
 app.use('/api/v1/governance', governanceRouter);
 app.use('/api/v1', goalsRouter);
 
+// ─── Health check — responds immediately, no DB dependency ───────────────────
+app.get('/api/health', (_req, res) => {
+  res.json({ status: 'ok', ts: new Date().toISOString() });
+});
+
 // ─── SSE broadcast ────────────────────────────────────────────────────────────
 let sseClients: express.Response[] = [];
 
