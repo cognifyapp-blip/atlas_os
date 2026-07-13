@@ -8,3 +8,9 @@ healthcheckPath = "/api/v1/scheduler/status"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
+
+[nixpacks]
+aptPkgs = ["openssl"]
+
+[nixpacks.variables]
+NIXPACKS_NODE_VERSION = "22"
