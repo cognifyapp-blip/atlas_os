@@ -75,6 +75,7 @@ app.use('/api/v1/governance', governanceRouter);
 app.use('/api/v1', goalsRouter);
 
 // ─── Health check — responds immediately, no DB dependency ───────────────────
+// Simple liveness probe used by Railway and load balancers.
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', ts: new Date().toISOString() });
 });
