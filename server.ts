@@ -894,13 +894,19 @@ async function seedDemoData(orgId: string) {
 
 async function startServer() {
   // 1. Start Atlas Execution Engine (Redis + BullMQ + Workers)
+  // Skip entirely if REDIS_URL is not configured — workers are optional
   let engineStarted = false;
-  try {
-    const { executionEngine } = await import('./src/infrastructure/ExecutionEngine.js');
-    await executionEngine.start();
-    engineStarted = true;
-  } catch (err: any) {
-    console.warn(`[Atlas] Execution Engine offline: ${err.message}. Set REDIS_URL to enable workers.`);
+  const redisUrl = process.env.REDIS_URL?.trim();
+  if (!redisUrl) {
+    console.warn('[Atlas] Execution Engine offline: REDIS_URL not set. Workers disabled — HTTP API and AI executives still work normally.');
+  } else {
+    try {
+      const { executionEngine } = await import('./src/infrastructure/ExecutionEngine.js');
+      await executionEngine.start();
+      engineStarted = true;
+    } catch (err: any) {
+      console.warn(`[Atlas] Execution Engine offline: ${err.message}.`);
+    }
   }
 
   // 2. Seed demo data for initialized organizations

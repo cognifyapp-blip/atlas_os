@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import { useAuth, useUser, SignIn } from '@clerk/clerk-react';
 import { Agent, Decision, MemoryEntry, FeedEvent, Lead, Proposal, Workflow, OrganizationContext } from './types';
 import Sidebar from './components/Sidebar';
 import LandingPage from './components/LandingPage';
@@ -22,6 +23,26 @@ import GovernancePanel from './components/GovernancePanel';
 import MissionGoalsView from './components/MissionGoalsView';
 
 export default function App() {
+  // Clerk auth — gracefully degrades when Clerk is not configured
+  const authHook = (() => { try { return useAuth(); } catch { return null; } })();
+  const userHook = (() => { try { return useUser(); } catch { return null; } })();
+  const isClerkLoaded = authHook?.isLoaded ?? true;
+  const isSignedIn = authHook?.isSignedIn ?? true; // default true when Clerk not configured
+  const getToken = authHook?.getToken ?? (async () => null);
+
+  // Authenticated fetch — attaches Clerk Bearer token when available
+  const authFetch = useCallback(async (url: string, options: RequestInit = {}) => {
+    const token = await getToken();
+    const headers: Record<string, string> = {
+      ...(options.headers as Record<string, string> ?? {}),
+    };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (options.body && !headers['Content-Type']) {
+      headers['Content-Type'] = 'application/json';
+    }
+    return fetch(url, { ...options, headers });
+  }, [getToken]);
+
   // Navigation & Screen Router
   const [screen, setScreen] = useState<'landing' | 'onboarding' | 'main'>('landing');
   const [currentView, setCurrentView] = useState<string>('dashboard');
@@ -52,17 +73,17 @@ export default function App() {
   const [activeReviewDecision, setActiveReviewDecision] = useState<Decision | null>(null);
 
   // 1. Fetch current gateway states
-  const fetchState = async () => {
+  const fetchState = useCallback(async () => {
     try {
       const [resContext, resAgents, resDecisions, resLeads, resProposals, resMemories, resWorkflows, resFeeds] = await Promise.all([
-        fetch('/api/v1/onboarding/context'),
-        fetch('/api/v1/agents'),
-        fetch('/api/v1/decisions'),
-        fetch('/api/v1/leads'),
-        fetch('/api/v1/proposals'),
-        fetch('/api/v1/memories'),
-        fetch('/api/v1/workflows'),
-        fetch('/api/v1/feeds'),
+        authFetch('/api/v1/onboarding/context'),
+        authFetch('/api/v1/agents'),
+        authFetch('/api/v1/decisions'),
+        authFetch('/api/v1/leads'),
+        authFetch('/api/v1/proposals'),
+        authFetch('/api/v1/memories'),
+        authFetch('/api/v1/workflows'),
+        authFetch('/api/v1/feeds'),
       ]);
 
       const dataContext = await resContext.json();
@@ -90,11 +111,11 @@ export default function App() {
     } catch (err) {
       console.error('Error seeding gateway state:', err);
     }
-  };
+  }, [authFetch]);
 
   useEffect(() => {
-    fetchState();
-  }, []);
+    if (isClerkLoaded && isSignedIn) fetchState();
+  }, [isClerkLoaded, isSignedIn, fetchState]);
 
   // 2. Real-Time SSE Stream Integration
   useEffect(() => {
@@ -147,69 +168,45 @@ export default function App() {
 
   const handleTriggerQualify = async (leadId: string) => {
     try {
-      const response = await fetch(`/api/v1/leads/${leadId}/qualify`, { method: 'POST' });
+      const response = await authFetch(`/api/v1/leads/${leadId}/qualify`, { method: 'POST' });
       const data = await response.json();
-      if (data.success) {
-        fetchState(); // Sync fully updated lead, proposal, and decision models
-      }
-    } catch (err) {
-      console.error(err);
-    }
+      if (data.success) fetchState();
+    } catch (err) { console.error(err); }
   };
 
   const handleImportCSV = async (csvText: string) => {
     try {
-      const response = await fetch('/api/v1/leads/import', {
+      const response = await authFetch('/api/v1/leads/import', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ csvText }),
       });
       const data = await response.json();
-      if (data.created > 0) {
-        fetchState();
-      }
-    } catch (err) {
-      console.error(err);
-    }
+      if (data.created > 0) fetchState();
+    } catch (err) { console.error(err); }
   };
 
   const handleAddManualLead = async (leadData: any) => {
     try {
-      const response = await fetch('/api/v1/leads', {
+      const response = await authFetch('/api/v1/leads', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(leadData),
       });
-      if (response.ok) {
-        fetchState();
-      }
-    } catch (err) {
-      console.error(err);
-    }
+      if (response.ok) fetchState();
+    } catch (err) { console.error(err); }
   };
 
   const handleApproveDecision = async (id: string) => {
     try {
-      const response = await fetch(`/api/v1/decisions/${id}/approve`, { method: 'POST' });
-      if (response.ok) {
-        setActiveReviewDecision(null);
-        fetchState();
-      }
-    } catch (err) {
-      console.error(err);
-    }
+      const response = await authFetch(`/api/v1/decisions/${id}/approve`, { method: 'POST' });
+      if (response.ok) { setActiveReviewDecision(null); fetchState(); }
+    } catch (err) { console.error(err); }
   };
 
   const handleDeclineDecision = async (id: string) => {
     try {
-      const response = await fetch(`/api/v1/decisions/${id}/decline`, { method: 'POST' });
-      if (response.ok) {
-        setActiveReviewDecision(null);
-        fetchState();
-      }
-    } catch (err) {
-      console.error(err);
-    }
+      const response = await authFetch(`/api/v1/decisions/${id}/decline`, { method: 'POST' });
+      if (response.ok) { setActiveReviewDecision(null); fetchState(); }
+    } catch (err) { console.error(err); }
   };
 
   const handleAddFeedAlert = (agentId: string, action: string, text: string, status: any) => {
@@ -218,15 +215,12 @@ export default function App() {
 
   const handleAddMemory = async (text: string, type: any, actor: string) => {
     try {
-      await fetch('/api/v1/memories', {
+      await authFetch('/api/v1/memories', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, type, actor, sourceSystem: 'Central Intelligence Office', tags: ['manual'] }),
       });
       fetchState();
-    } catch (err) {
-      console.error(err);
-    }
+    } catch (err) { console.error(err); }
   };
 
   const handleCommandCenterAction = (actionKey: string) => {
@@ -446,6 +440,40 @@ export default function App() {
       </div>
     );
   };
+
+  // Clerk loading state
+  if (!isClerkLoaded) {
+    return (
+      <div className="min-h-screen bg-[#fdf8f8] flex items-center justify-center">
+        <div className="flex flex-col items-center space-y-4">
+          <div className="w-10 h-10 rounded-xl bg-black flex items-center justify-center">
+            <span className="text-white font-mono font-bold text-lg">A</span>
+          </div>
+          <p className="text-xs font-mono text-gray-400 uppercase tracking-widest">Initializing...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Clerk sign-in gate — only shown when Clerk is configured and user is not signed in
+  if (authHook && !isSignedIn) {
+    return (
+      <div className="min-h-screen bg-[#fdf8f8] flex items-center justify-center">
+        <div className="flex flex-col items-center space-y-8">
+          <div className="flex items-center space-x-3">
+            <div className="w-10 h-10 rounded-xl bg-black flex items-center justify-center shadow-md">
+              <span className="text-white font-mono font-bold text-lg">A</span>
+            </div>
+            <div>
+              <h1 className="font-sans font-bold text-sm tracking-tight text-gray-900">ATLAS OS</h1>
+              <p className="text-[10px] font-mono text-brand-bronze tracking-wider uppercase">Autonomous Operating System</p>
+            </div>
+          </div>
+          <SignIn routing="hash" />
+        </div>
+      </div>
+    );
+  }
 
   if (screen === 'landing') return <LandingPage onStart={() => setScreen('onboarding')} />;
   if (screen === 'onboarding') return <Onboarding onCompleted={handleOnboardingCompleted} />;

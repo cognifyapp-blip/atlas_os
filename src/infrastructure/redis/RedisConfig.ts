@@ -51,7 +51,8 @@ function parseRedisUrl(url: string): Partial<RedisConfig> {
  * Priority: REDIS_URL > individual REDIS_HOST / REDIS_PORT / REDIS_PASSWORD vars.
  */
 export function getRedisConfig(): RedisConfig {
-  const fromUrl = process.env.REDIS_URL ? parseRedisUrl(process.env.REDIS_URL) : {};
+  const rawUrl = process.env.REDIS_URL?.trim();
+  const fromUrl = rawUrl ? parseRedisUrl(rawUrl) : {};
 
   return {
     host: fromUrl.host ?? process.env.REDIS_HOST ?? '127.0.0.1',
