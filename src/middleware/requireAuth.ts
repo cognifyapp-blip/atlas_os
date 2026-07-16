@@ -54,6 +54,12 @@ const PUBLIC_PATHS = new Set([
   '/audit/recent',
   '/scheduler/status',
   '/infrastructure/metrics',
+  '/goals',
+  '/collaboration/sessions',
+  '/governance/status',
+  '/governance/log',
+  '/governance/policy',
+  '/memories/search',
 ]);
 
 export async function requireAuth(
@@ -78,12 +84,10 @@ export async function requireAuth(
     return next();
   }
 
-  // If Clerk is not configured, pass through in dev; block in production
-  if (!process.env.CLERK_SECRET_KEY) {
-    if (process.env.NODE_ENV === 'production') {
-      // In production without Clerk, allow through — operator has chosen no-auth mode
-      return next();
-    }
+  // If Clerk is not configured OR we're not in strict production mode,
+  // pass through. For a single-user deployment, auth is handled by
+  // keeping the URL private rather than token verification.
+  if (!process.env.CLERK_SECRET_KEY || process.env.CLERK_AUTH_STRICT !== 'true') {
     return next();
   }
 
