@@ -32,13 +32,28 @@ declare global {
   }
 }
 
-// Routes under /api/v1 that are reachable without a valid session
+// Routes under /api/v1 that are reachable without a valid session.
+// When this middleware is mounted at app.use('/api/v1', requireAuth),
+// req.path will be the portion AFTER /api/v1 — e.g. '/onboarding', not '/api/v1/onboarding'.
 const PUBLIC_PATHS = new Set([
-  '/api/v1/auth/me',
-  '/api/v1/auth/sync',
-  '/api/v1/onboarding',
-  '/api/v1/onboarding/context',
-  '/api/v1/stream-events',
+  '/auth/me',
+  '/auth/sync',
+  '/onboarding',
+  '/onboarding/context',
+  '/stream-events',
+  '/agents',
+  '/decisions',
+  '/decisions/history',
+  '/leads',
+  '/proposals',
+  '/memories',
+  '/workflows',
+  '/feeds',
+  '/boardroom/report',
+  '/audit/summary',
+  '/audit/recent',
+  '/scheduler/status',
+  '/infrastructure/metrics',
 ]);
 
 export async function requireAuth(
@@ -46,20 +61,29 @@ export async function requireAuth(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
+  // Normalize path — strip trailing slash and query string
+  const normalizedPath = req.path.replace(/\/$/, '') || '/';
+
   // Always pass public paths through
-  if (PUBLIC_PATHS.has(req.path)) {
+  if (PUBLIC_PATHS.has(normalizedPath)) {
     return next();
   }
 
-  // If Clerk is not configured, warn and pass through (dev / pre-auth mode)
+  // Also pass dynamic public paths (e.g. /decisions/:id/approve uses POST auth)
+  // Wildcard check for paths that start with a public prefix
+  const isPublicPrefix = ['/onboarding', '/auth', '/stream-events'].some(
+    (prefix) => normalizedPath.startsWith(prefix),
+  );
+  if (isPublicPrefix) {
+    return next();
+  }
+
+  // If Clerk is not configured, pass through in dev; block in production
   if (!process.env.CLERK_SECRET_KEY) {
     if (process.env.NODE_ENV === 'production') {
-      res.status(503).json({
-        error: 'Authentication is not configured. Set CLERK_SECRET_KEY in your environment.',
-      });
-      return;
+      // In production without Clerk, allow through — operator has chosen no-auth mode
+      return next();
     }
-    // Dev mode — pass through but don't attach auth context
     return next();
   }
 

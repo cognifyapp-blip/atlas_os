@@ -86,14 +86,25 @@ export default function App() {
         authFetch('/api/v1/feeds'),
       ]);
 
-      const dataContext = await resContext.json();
-      const dataAgents = await resAgents.json();
-      const dataDecisions = await resDecisions.json();
-      const dataLeads = await resLeads.json();
-      const dataProposals = await resProposals.json();
-      const dataMemories = await resMemories.json();
-      const dataWorkflows = await resWorkflows.json();
-      const dataFeeds = await resFeeds.json();
+      // Parse all responses — use safe fallbacks if any endpoint fails
+      const safeJson = async (res: Response, fallback: any) => {
+        if (!res.ok) {
+          console.warn(`[Atlas] API ${res.url} returned ${res.status}`);
+          return fallback;
+        }
+        try { return await res.json(); } catch { return fallback; }
+      };
+
+      const [dataContext, dataAgents, dataDecisions, dataLeads, dataProposals, dataMemories, dataWorkflows, dataFeeds] = await Promise.all([
+        safeJson(resContext,   { context: { initialized: false }, briefing: null }),
+        safeJson(resAgents,    { agents: [] }),
+        safeJson(resDecisions, { decisions: [] }),
+        safeJson(resLeads,     { leads: [] }),
+        safeJson(resProposals, { proposals: [] }),
+        safeJson(resMemories,  { memories: [] }),
+        safeJson(resWorkflows, { workflows: [] }),
+        safeJson(resFeeds,     { feeds: [] }),
+      ]);
 
       setOrgContext(dataContext.context);
       setBriefing(dataContext.briefing);
@@ -159,11 +170,12 @@ export default function App() {
   // -----------------------------------------------------------------------------
   // Operations Handlers
   // -----------------------------------------------------------------------------
-  const handleOnboardingCompleted = (context: OrganizationContext, briefingResult: any) => {
-    setOrgContext(context);
+  const handleOnboardingCompleted = async (context: OrganizationContext, briefingResult: any) => {
+    setOrgContext({ ...context, initialized: true });
     setBriefing(briefingResult);
     setScreen('main');
-    fetchState(); // sync state
+    // Re-sync from DB in background — don't await so screen transition is instant
+    fetchState();
   };
 
   const handleTriggerQualify = async (leadId: string) => {
