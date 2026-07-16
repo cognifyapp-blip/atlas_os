@@ -25,15 +25,14 @@ if (!rawConnectionString) {
  * Strip parameters that the `pg` driver doesn't support.
  * Neon sometimes includes `channel_binding=require` which causes
  * SASL authentication errors with the pg adapter.
+ * Uses regex to avoid URL parsing issues with non-standard hostnames.
  */
 function sanitizeConnectionString(url: string): string {
-  try {
-    const parsed = new URL(url);
-    parsed.searchParams.delete('channel_binding');
-    return parsed.toString();
-  } catch {
-    return url;
-  }
+  // Remove channel_binding parameter in all its forms
+  return url
+    .replace(/[&?]channel_binding=[^&]*/g, '')
+    .replace(/\?&/, '?')   // fix ?& → ? if it was the first param
+    .replace(/[?&]$/, ''); // strip trailing ? or &
 }
 
 const connectionString = sanitizeConnectionString(rawConnectionString);
