@@ -44,7 +44,10 @@ export default function App() {
   }, [getToken]);
 
   // Navigation & Screen Router
-  const [screen, setScreen] = useState<'landing' | 'onboarding' | 'main'>('landing');
+  // Start with null (unknown) — fetchState will determine the correct screen
+  // based on whether the org is already initialized in the database.
+  // This prevents returning users from seeing the landing/onboarding flow again.
+  const [screen, setScreen] = useState<'landing' | 'onboarding' | 'main' | null>(null);
   const [currentView, setCurrentView] = useState<string>('dashboard');
   const [boardroomActive, setBoardroomActive] = useState<boolean>(false);
   const [commandCenterOpen, setCommandCenterOpen] = useState<boolean>(false);
@@ -118,14 +121,19 @@ export default function App() {
 
       if (dataContext.context.initialized) {
         setScreen('main');
+      } else {
+        // Org not yet initialized — show landing page for fresh setup
+        setScreen('landing');
       }
     } catch (err) {
       console.error('Error seeding gateway state:', err);
+      setScreen('landing');
     }
   }, [authFetch]);
 
   useEffect(() => {
     if (isClerkLoaded && isSignedIn) fetchState();
+    else if (isClerkLoaded && !isSignedIn) setScreen('landing'); // not signed in, will hit Clerk gate above
   }, [isClerkLoaded, isSignedIn, fetchState]);
 
   // 2. Real-Time SSE Stream Integration
@@ -482,6 +490,21 @@ export default function App() {
             </div>
           </div>
           <SignIn routing="hash" />
+        </div>
+      </div>
+    );
+  }
+
+  // Screen is null while fetchState is in-flight — show a loading spinner
+  // so returning users never see the landing page flash before going to main.
+  if (screen === null) {
+    return (
+      <div className="min-h-screen bg-[#fdf8f8] flex items-center justify-center">
+        <div className="flex flex-col items-center space-y-4">
+          <div className="w-10 h-10 rounded-xl bg-black flex items-center justify-center">
+            <span className="text-white font-mono font-bold text-lg">A</span>
+          </div>
+          <p className="text-xs font-mono text-gray-400 uppercase tracking-widest">Loading workspace...</p>
         </div>
       </div>
     );
