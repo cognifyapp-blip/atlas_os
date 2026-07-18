@@ -1,444 +1,622 @@
 /**
- * @license
- * SPDX-License-Identifier: Apache-2.0
+ * Atlas OS — Organization Pulse (Real-Time)
+ *
+ * All 10 executives shown as nodes. Particles are driven exclusively by real
+ * SSE agent_activity events — no random simulation. When Zephyr sends data
+ * to Aurelia, a particle travels Zephyr→Aurelia on the canvas in real time.
+ *
+ * Clicking any node opens a live activity panel for that executive.
+ * Agents join/leave dynamically as they become active or idle.
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Agent } from '../types';
-import { Building, Sparkles, TrendingUp, Cpu, RefreshCw, X } from 'lucide-react';
+import { X, Activity, Zap, Clock, CheckCircle2, ArrowRight } from 'lucide-react';
 
 interface OrganizationPulseProps {
   agents: Agent[];
 }
 
-interface Node {
-  id: string;
-  name: string;
-  agentId: string;
-  x: number;
-  y: number;
-  radius: number;
-  color: string;
+// ─── SSE event shape ──────────────────────────────────────────────────────────
+
+interface AgentActivityEvent {
+  executiveId: string;
+  executiveName: string;
+  organizationId: string;
+  status: 'IDLE' | 'ACTIVE' | 'BUSY' | 'OFFLINE';
+  action: string | null;
+  toExecutiveId: string | null;
+  toExecutiveName: string | null;
+  ts: string;
 }
 
-interface Particle {
-  fromNode: string;
-  toNode: string;
-  progress: number; // 0 to 1
-  speed: number;
-  size: number;
+// ─── Canvas types ─────────────────────────────────────────────────────────────
+
+interface NodeLayout {
+  id: string;         // executive DB id
+  name: string;
+  role: string;
+  avatar: string;
+  x: number;         // 0–1 normalized
+  y: number;
   color: string;
+  radius: number;
 }
+
+interface LiveParticle {
+  id: string;
+  fromId: string;
+  toId: string;
+  progress: number;
+  speed: number;
+  color: string;
+  size: number;
+  label: string;
+}
+
+// ─── Activity log entry ───────────────────────────────────────────────────────
+
+interface ActivityEntry {
+  id: string;
+  executiveName: string;
+  action: string;
+  toExecutiveName: string | null;
+  status: string;
+  ts: string;
+}
+
+// ─── Colour palette per executive role ───────────────────────────────────────
+
+const ROLE_COLORS: Record<string, string> = {
+  'CEO':        '#1c1b1b',
+  'Finance':    '#b45309',
+  'Sales':      '#047857',
+  'Marketing':  '#0369a1',
+  'Customer':   '#7c3aed',
+  'HR':         '#be185d',
+  'Operations': '#0f766e',
+  'Legal':      '#92400e',
+  'Developer':  '#1d4ed8',
+  'Intelligence': '#6d28d9',
+};
+
+function agentColor(role: string): string {
+  for (const [key, color] of Object.entries(ROLE_COLORS)) {
+    if (role.toLowerCase().includes(key.toLowerCase())) return color;
+  }
+  return '#6b7280';
+}
+
+// ─── Position 10 nodes in a circle with CEO at center ────────────────────────
+
+function buildLayout(agents: Agent[]): NodeLayout[] {
+  if (agents.length === 0) return [];
+
+  const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
+
+  // CEO goes to center
+  const ceoIdx = sorted.findIndex((a) =>
+    a.name.toLowerCase().includes('atlas') || a.role.toLowerCase().includes('ceo'),
+  );
+  const ceo = ceoIdx >= 0 ? sorted.splice(ceoIdx, 1)[0] : null;
+
+  const layouts: NodeLayout[] = [];
+
+  // Remaining agents arranged in a circle
+  const count = sorted.length;
+  sorted.forEach((agent, i) => {
+    const angle = (i / count) * Math.PI * 2 - Math.PI / 2;
+    layouts.push({
+      id: agent.id,
+      name: agent.name,
+      role: agent.role,
+      avatar: agent.avatar,
+      x: 0.5 + 0.38 * Math.cos(angle),
+      y: 0.5 + 0.38 * Math.sin(angle),
+      color: agentColor(agent.role),
+      radius: 28,
+    });
+  });
+
+  // CEO at center (larger node)
+  if (ceo) {
+    layouts.push({
+      id: ceo.id,
+      name: ceo.name,
+      role: ceo.role,
+      avatar: ceo.avatar,
+      x: 0.5,
+      y: 0.5,
+      color: '#1c1b1b',
+      radius: 38,
+    });
+  }
+
+  return layouts;
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
 
 export default function OrganizationPulse({ agents }: OrganizationPulseProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animFrameRef = useRef<number>(0);
+
+  // Live state driven by SSE
+  const [liveStatus, setLiveStatus] = useState<Record<string, AgentActivityEvent>>({});
+  const [particles, setParticles] = useState<LiveParticle[]>([]);
+  const [activityLog, setActivityLog] = useState<ActivityEntry[]>([]);
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
+  const [connected, setConnected] = useState(false);
 
-  const nodes: Node[] = [
-    { id: 'exec', name: 'Executive Office', agentId: 'ceo_assistant', x: 0.5, y: 0.5, radius: 45, color: '#1c1b1b' },
-    { id: 'finance', name: 'Finance Ledger', agentId: 'finance_ai', x: 0.2, y: 0.3, radius: 36, color: '#9a4614' },
-    { id: 'sales', name: 'Sales Pipeline', agentId: 'sales_ai', x: 0.8, y: 0.3, radius: 36, color: '#047857' },
-    { id: 'marketing', name: 'Marketing Studio', agentId: 'marketing_ai', x: 0.5, y: 0.8, radius: 36, color: '#0369a1' },
-  ];
+  const layout = buildLayout(agents);
 
-  const connections = [
-    { from: 'exec', to: 'finance' },
-    { from: 'exec', to: 'sales' },
-    { from: 'exec', to: 'marketing' },
-    { from: 'sales', to: 'finance' },
-    { from: 'marketing', to: 'sales' },
-  ];
+  // ── SSE connection ──────────────────────────────────────────────────────────
 
-  const particlesRef = useRef<Particle[]>([]);
-
-  // Periodically inject particles between active nodes to simulate life
   useEffect(() => {
-    const interval = setInterval(() => {
-      // Find active connections
-      connections.forEach((conn) => {
-        const fromAgent = agents.find((a) => a.id === nodes.find((n) => n.id === conn.from)?.agentId);
-        const toAgent = agents.find((a) => a.id === nodes.find((n) => n.id === conn.to)?.agentId);
+    const es = new EventSource('/api/v1/stream-events');
 
-        // If either is running or in process, seed more particles
-        const isActive = (fromAgent?.status === 'In Process') || (toAgent?.status === 'In Process') || Math.random() > 0.4;
-        
-        if (isActive) {
-          particlesRef.current.push({
-            fromNode: conn.from,
-            toNode: conn.to,
+    es.onopen = () => setConnected(true);
+    es.onerror = () => setConnected(false);
+
+    es.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload.type !== 'agent_activity') return;
+        const data: AgentActivityEvent = payload.data;
+
+        // Update live status for this executive
+        setLiveStatus((prev) => ({ ...prev, [data.executiveId]: data }));
+
+        // Add to activity log (cap at 50)
+        const entry: ActivityEntry = {
+          id: `${data.executiveId}-${data.ts}`,
+          executiveName: data.executiveName,
+          action: data.action ?? 'Status update',
+          toExecutiveName: data.toExecutiveName,
+          status: data.status,
+          ts: data.ts,
+        };
+        setActivityLog((prev) => [entry, ...prev].slice(0, 50));
+
+        // Spawn a real particle if this is a data exchange between two agents
+        if (data.toExecutiveId) {
+          const newParticle: LiveParticle = {
+            id: `p-${Date.now()}-${Math.random()}`,
+            fromId: data.executiveId,
+            toId: data.toExecutiveId,
             progress: 0,
-            speed: 0.005 + Math.random() * 0.008,
-            size: 2 + Math.random() * 3,
-            color: nodes.find((n) => n.id === conn.from)?.color || '#9a4614',
-          });
+            speed: 0.006 + Math.random() * 0.004,
+            color: agentColor(
+              agents.find((a) => a.id === data.executiveId)?.role ?? '',
+            ),
+            size: 3,
+            label: data.action?.substring(0, 30) ?? '',
+          };
+          setParticles((prev) => [...prev, newParticle]);
         }
-      });
-    }, 1000);
+      } catch { /* ignore malformed */ }
+    };
 
-    return () => clearInterval(interval);
+    return () => es.close();
   }, [agents]);
 
-  // Main canvas rendering loops
-  useEffect(() => {
-    let animationFrameId: number;
+  // ── Advance particles on each frame ──────────────────────────────────────────
 
+  const particlesRef = useRef(particles);
+  useEffect(() => { particlesRef.current = particles; }, [particles]);
+
+  // ── Canvas render loop ────────────────────────────────────────────────────────
+
+  const render = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const resizeCanvas = () => {
-      const container = containerRef.current;
-      if (!container) return;
-      canvas.width = container.clientWidth;
-      canvas.height = 420; // fixed target height
-    };
+    const W = canvas.width;
+    const H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
 
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas);
+    const getPos = (node: NodeLayout) => ({ x: node.x * W, y: node.y * H });
 
-    const render = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const w = canvas.width;
-      const h = canvas.height;
+    // 1. Draw faint connection lines between all nodes and CEO
+    const ceoNode = layout.find((n) => n.radius === 38);
+    layout.forEach((node) => {
+      if (!ceoNode || node.id === ceoNode.id) return;
+      const p1 = getPos(node);
+      const p2 = getPos(ceoNode);
+      ctx.strokeStyle = 'rgba(0,0,0,0.05)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 5]);
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
 
-      // Helper to convert normalized nodes positions to actual pixels
-      const getPixelPos = (node: Node) => ({
-        x: node.x * w,
-        y: node.y * h,
-      });
-
-      // 1. Draw Connection Lines
+    // 2. Active data-exchange connections — bright line when busy
+    const now = Date.now();
+    Object.values(liveStatus).forEach((evt) => {
+      if (!evt.toExecutiveId) return;
+      const fromNode = layout.find((n) => n.id === evt.executiveId);
+      const toNode = layout.find((n) => n.id === evt.toExecutiveId);
+      if (!fromNode || !toNode) return;
+      const age = now - new Date(evt.ts).getTime();
+      if (age > 8000) return; // fade after 8s
+      const alpha = Math.max(0, 1 - age / 8000);
+      const p1 = getPos(fromNode);
+      const p2 = getPos(toNode);
+      ctx.strokeStyle = fromNode.color + Math.round(alpha * 200).toString(16).padStart(2, '0');
       ctx.lineWidth = 1.5;
-      connections.forEach((conn) => {
-        const fromNode = nodes.find((n) => n.id === conn.from)!;
-        const toNode = nodes.find((n) => n.id === conn.to)!;
-        const p1 = getPixelPos(fromNode);
-        const p2 = getPixelPos(toNode);
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.stroke();
+    });
 
-        ctx.strokeStyle = 'rgba(28, 27, 27, 0.08)';
-        ctx.setLineDash([4, 4]);
+    // 3. Draw and advance particles
+    const alive: LiveParticle[] = [];
+    particlesRef.current.forEach((p) => {
+      const fromNode = layout.find((n) => n.id === p.fromId);
+      const toNode = layout.find((n) => n.id === p.toId);
+      if (!fromNode || !toNode) return;
+      const fp = getPos(fromNode);
+      const tp = getPos(toNode);
+      const cx = fp.x + (tp.x - fp.x) * p.progress;
+      const cy = fp.y + (tp.y - fp.y) * p.progress;
+
+      // Glow
+      const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, p.size * 4);
+      grad.addColorStop(0, p.color + 'cc');
+      grad.addColorStop(1, p.color + '00');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(cx, cy, p.size * 4, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Core dot
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(cx, cy, p.size, 0, Math.PI * 2);
+      ctx.fill();
+
+      const next = { ...p, progress: p.progress + p.speed };
+      if (next.progress < 1) alive.push(next);
+    });
+
+    if (alive.length !== particlesRef.current.length) {
+      setParticles(alive);
+    } else {
+      // mutate in place for speed (avoids re-render noise)
+      particlesRef.current.forEach((p, i) => { p.progress = alive[i]?.progress ?? 1; });
+    }
+
+    // 4. Draw nodes
+    layout.forEach((node) => {
+      const pos = getPos(node);
+      const live = liveStatus[node.id];
+      const isBusy = live?.status === 'BUSY';
+      const isActive = live?.status === 'ACTIVE' || isBusy;
+
+      // Pulse ring for active agents
+      if (isActive) {
+        const pulse = node.radius + 6 + Math.sin(Date.now() / 200) * 3;
+        ctx.strokeStyle = node.color + '55';
+        ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(p1.x, p1.y);
-        ctx.lineTo(p2.x, p2.y);
+        ctx.arc(pos.x, pos.y, pulse, 0, Math.PI * 2);
         ctx.stroke();
-      });
-      ctx.setLineDash([]); // Reset line dash
+      }
 
-      // 2. Update and Draw Particles
-      particlesRef.current.forEach((part, index) => {
-        const fromNode = nodes.find((n) => n.id === part.fromNode)!;
-        const toNode = nodes.find((n) => n.id === part.toNode)!;
-        const p1 = getPixelPos(fromNode);
-        const p2 = getPixelPos(toNode);
+      // Node fill
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = 'rgba(0,0,0,0.08)';
+      ctx.shadowBlur = 12;
+      ctx.shadowOffsetY = 3;
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, node.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowColor = 'transparent';
 
-        // Linear interpolation
-        const currentX = p1.x + (p2.x - p1.x) * part.progress;
-        const currentY = p1.y + (p2.y - p1.y) * part.progress;
+      // Coloured ring
+      ctx.strokeStyle = isActive ? node.color : node.color + '55';
+      ctx.lineWidth = isBusy ? 3 : 1.5;
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, node.radius, 0, Math.PI * 2);
+      ctx.stroke();
 
-        // Draw particle
-        ctx.fillStyle = part.color;
-        ctx.beginPath();
-        ctx.arc(currentX, currentY, part.size, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Add glow aura
-        ctx.fillStyle = part.color + '22';
-        ctx.beginPath();
-        ctx.arc(currentX, currentY, part.size * 2.5, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Advance progress
-        part.progress += part.speed;
-      });
-
-      // Filter out completed particles
-      particlesRef.current = particlesRef.current.filter((p) => p.progress < 1);
-
-      // 3. Draw Nodes
-      nodes.forEach((node) => {
-        const pos = getPixelPos(node);
-        const agent = agents.find((a) => a.id === node.agentId);
-
-        // Active animated aura rings if the agent is "In Process"
-        if (agent?.status === 'In Process') {
-          const auraRadius = node.radius + 8 + Math.sin(Date.now() / 150) * 4;
-          ctx.strokeStyle = node.color + '33';
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.arc(pos.x, pos.y, auraRadius, 0, Math.PI * 2);
-          ctx.stroke();
-        }
-
-        // Draw outer white fill
-        ctx.fillStyle = '#ffffff';
-        ctx.shadowColor = 'rgba(0,0,0,0.04)';
-        ctx.shadowBlur = 10;
-        ctx.shadowOffsetY = 4;
-        ctx.beginPath();
-        ctx.arc(pos.x, pos.y, node.radius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.shadowColor = 'transparent'; // Reset shadow
-
-        // Draw solid thin border
-        ctx.strokeStyle = 'rgba(0,0,0,0.06)';
-        ctx.lineWidth = 1;
-        ctx.stroke();
-
-        // Draw inner status indicator arc
+      // Status arc sweep (animated when busy)
+      if (isBusy) {
+        const start = (Date.now() / 800) % (Math.PI * 2);
         ctx.strokeStyle = node.color;
         ctx.lineWidth = 3;
         ctx.beginPath();
-        const startAngle = (Date.now() / 1000) % (Math.PI * 2);
-        ctx.arc(pos.x, pos.y, node.radius - 4, startAngle, startAngle + Math.PI * 0.8);
+        ctx.arc(pos.x, pos.y, node.radius - 4, start, start + Math.PI * 0.7);
         ctx.stroke();
+      }
 
-        // Draw center icon labels or agent acronyms
-        ctx.fillStyle = '#1c1b1b';
-        ctx.font = 'bold 11px font-mono, ui-monospace, monospace';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        const nameAcronym = node.name.split(' ').map((w) => w[0]).join('');
-        ctx.fillText(nameAcronym, pos.x, pos.y - 3);
+      // Initials label
+      const initials = node.name.split(/[\s(]/)[0].substring(0, 3);
+      ctx.fillStyle = isBusy ? node.color : '#374151';
+      ctx.font = `bold ${node.radius > 30 ? 11 : 9}px ui-monospace, monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(initials, pos.x, pos.y - 4);
 
-        ctx.fillStyle = '#64748b';
-        ctx.font = '500 8px font-sans';
-        ctx.fillText(agent?.status || 'Active', pos.x, pos.y + 10);
-      });
+      // Status text
+      const statusText = isBusy ? 'BUSY' : isActive ? 'ACTIVE' : 'IDLE';
+      ctx.fillStyle = isBusy ? node.color : '#9ca3af';
+      ctx.font = `500 7px ui-sans-serif, sans-serif`;
+      ctx.fillText(statusText, pos.x, pos.y + 8);
+    });
 
-      animationFrameId = requestAnimationFrame(render);
+    animFrameRef.current = requestAnimationFrame(render);
+  }, [layout, liveStatus]);
+
+  // ── Canvas sizing + render loop ───────────────────────────────────────────────
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    if (!canvas || !container) return;
+
+    const resize = () => {
+      canvas.width = container.clientWidth;
+      canvas.height = container.clientHeight;
     };
-
-    render();
+    resize();
+    window.addEventListener('resize', resize);
+    animFrameRef.current = requestAnimationFrame(render);
 
     return () => {
-      cancelAnimationFrame(animationFrameId);
-      window.removeEventListener('resize', resizeCanvas);
+      window.removeEventListener('resize', resize);
+      cancelAnimationFrame(animFrameRef.current);
     };
-  }, [agents]);
+  }, [render]);
+
+  // ── Click handler — hit-test nodes ───────────────────────────────────────────
 
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-
     const rect = canvas.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const clickY = e.clientY - rect.top;
+    // Scale mouse coords to canvas resolution
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const mx = (e.clientX - rect.left) * scaleX;
+    const my = (e.clientY - rect.top) * scaleY;
 
-    const w = canvas.width;
-    const h = canvas.height;
-
-    // Detect click collision with any node
-    let clickedNode: Node | null = null;
-    nodes.forEach((node) => {
-      const nodeX = node.x * w;
-      const nodeY = node.y * h;
-      const dist = Math.hypot(clickX - nodeX, clickY - nodeY);
-      if (dist <= node.radius) {
-        clickedNode = node;
-      }
-    });
-
-    if (clickedNode) {
-      const agent = agents.find((a) => a.id === clickedNode!.agentId);
-      if (agent) {
-        setSelectedAgent(agent);
+    for (const node of layout) {
+      const nx = node.x * canvas.width;
+      const ny = node.y * canvas.height;
+      if (Math.hypot(mx - nx, my - ny) <= node.radius + 8) {
+        const agent = agents.find((a) => a.id === node.id);
+        if (agent) setSelectedAgent(agent);
+        return;
       }
     }
+    // Click on empty area — deselect
+    setSelectedAgent(null);
   };
+
+  // ── Activity log for a specific agent ────────────────────────────────────────
+
+  const agentLog = selectedAgent
+    ? activityLog.filter((e) => e.executiveName.includes(selectedAgent.name.split(' ')[0]))
+    : [];
+
+  const liveData = selectedAgent ? liveStatus[selectedAgent.id] : null;
+
+  // ─── Render ───────────────────────────────────────────────────────────────────
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
+      {/* Header */}
+      <div className="flex items-center justify-between">
         <div>
-          <span className="text-[10px] font-mono text-brand-bronze font-bold uppercase tracking-widest">VISUAL SYSTEM PULSE</span>
+          <span className="text-[10px] font-mono text-brand-bronze font-bold uppercase tracking-widest">LIVE SYSTEM PULSE</span>
           <h1 className="text-xl font-sans font-semibold text-gray-900 mt-0.5">Organization Pulse</h1>
-          <p className="text-xs text-gray-400 mt-1">Real-time inter-agent messaging channels and active department operations.</p>
+          <p className="text-xs text-gray-400 mt-1">
+            Real-time inter-executive data exchange. Particles appear when agents actually communicate.
+          </p>
         </div>
-        <div className="flex items-center space-x-2 text-[10px] font-mono bg-white px-3 py-1.5 rounded-lg border border-gray-100">
-          <div className="w-2.5 h-2.5 rounded-full bg-brand-bronze/10 flex items-center justify-center border border-brand-bronze/30 animate-pulse">
-            <div className="w-1.5 h-1.5 rounded-full bg-brand-bronze" />
-          </div>
-          <span className="text-gray-600">60 FPS WEBGL BACKUP ENGINES</span>
+        <div className={`flex items-center space-x-2 text-[10px] font-mono px-3 py-1.5 rounded-lg border ${connected ? 'border-emerald-100 bg-emerald-50' : 'border-gray-100 bg-gray-50'}`}>
+          <div className={`w-2 h-2 rounded-full ${connected ? 'bg-emerald-500 animate-pulse' : 'bg-gray-400'}`} />
+          <span className={connected ? 'text-emerald-700' : 'text-gray-500'}>
+            {connected ? 'SSE LIVE' : 'CONNECTING…'}
+          </span>
         </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        {/* Visual Pulse Stage */}
-        <div ref={containerRef} className="lg:col-span-3 bg-white border border-gray-100/60 rounded-2xl p-4 flex flex-col justify-center relative shadow-sm min-h-[440px]">
+        {/* Canvas */}
+        <div
+          ref={containerRef}
+          className="lg:col-span-3 bg-white border border-gray-100/60 rounded-2xl shadow-sm relative overflow-hidden"
+          style={{ height: '500px' }}
+        >
           <canvas
             ref={canvasRef}
             onClick={handleCanvasClick}
-            className="w-full h-[420px] cursor-pointer"
-            title="Click nodes to view real-time department indicators"
+            className="w-full h-full cursor-pointer"
           />
-
-          {/* Floating Instructions Banner */}
-          <div className="absolute bottom-4 left-4 bg-gray-50/80 backdrop-blur-sm border border-gray-100 rounded-lg px-3 py-2 text-[10px] text-gray-500 font-mono flex items-center space-x-2">
-            <span className="text-brand-bronze">💡</span>
-            <span>Interactive: Click department nodes to explore operational briefs.</span>
+          <div className="absolute bottom-4 left-4 bg-white/80 backdrop-blur-sm border border-gray-100 rounded-lg px-3 py-2 text-[10px] text-gray-400 font-mono space-y-0.5">
+            <p>● Click any agent node to inspect live activity</p>
+            <p>● Particles = real data being exchanged right now</p>
           </div>
+          {/* Particle count badge */}
+          {particles.length > 0 && (
+            <div className="absolute top-4 right-4 flex items-center space-x-1.5 bg-brand-bronze/10 border border-brand-bronze/20 rounded-full px-3 py-1">
+              <Zap className="w-3 h-3 text-brand-bronze animate-pulse" />
+              <span className="text-[10px] font-mono text-brand-bronze font-bold">
+                {particles.length} active exchange{particles.length !== 1 ? 's' : ''}
+              </span>
+            </div>
+          )}
         </div>
 
-        {/* Quick Departmenal Indicator Cards */}
+        {/* Right panel */}
         <div className="space-y-4">
-          <h2 className="text-xs font-semibold text-brand-bronze font-mono uppercase tracking-wider">Department Monitors</h2>
-          {nodes.map((node) => {
-            const agent = agents.find((a) => a.id === node.agentId);
-            return (
-              <button
-                key={node.id}
-                onClick={() => setSelectedAgent(agent || null)}
-                className="w-full p-4 bg-white rounded-xl border border-gray-100/60 flex items-start space-x-3 text-left hover:border-brand-bronze/20 hover:shadow-sm transition-all cursor-pointer"
-              >
-                <div
-                  className="w-2.5 h-2.5 rounded-full mt-1.5 flex-shrink-0"
-                  style={{ backgroundColor: node.color }}
-                />
-                <div className="space-y-1">
-                  <h3 className="text-xs font-semibold text-gray-900">{node.name}</h3>
-                  <p className="text-[10px] text-gray-400 font-mono uppercase tracking-wider">{agent?.role}</p>
-                  <div className="flex items-center space-x-1.5 pt-1">
-                    <span
-                      className={`text-[9px] font-mono px-1.5 py-0.5 rounded-md ${
-                        agent?.status === 'In Process'
-                          ? 'bg-amber-50 text-amber-700 font-bold animate-pulse'
-                          : agent?.status === 'Active'
-                          ? 'bg-emerald-50 text-emerald-700'
-                          : 'bg-gray-100 text-gray-500'
-                      }`}
-                    >
-                      {agent?.status || 'Active'}
-                    </span>
-                    <span className="text-[9px] text-gray-400 font-mono font-medium max-w-[120px] truncate">
-                      {agent?.lastAction}
-                    </span>
-                  </div>
+          {/* Activity log */}
+          <div>
+            <h3 className="text-[10px] font-mono text-brand-bronze font-bold uppercase tracking-widest mb-2">
+              Live Activity Feed
+            </h3>
+            <div className="space-y-1.5 max-h-[460px] overflow-y-auto pr-1">
+              {activityLog.length === 0 ? (
+                <div className="p-4 text-center text-[10px] text-gray-400 bg-gray-50 rounded-xl border border-gray-100">
+                  Waiting for agent activity…
+                  <br />
+                  <span className="text-gray-300">Trigger a workflow or qualify a lead to see live exchanges.</span>
                 </div>
-              </button>
-            );
-          })}
+              ) : (
+                activityLog.map((entry) => (
+                  <motion.div
+                    key={entry.id}
+                    initial={{ opacity: 0, x: 8 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    className="px-3 py-2 bg-white border border-gray-100 rounded-lg text-[10px] font-mono hover:border-brand-bronze/20 transition-colors cursor-default"
+                  >
+                    <div className="flex items-center justify-between mb-0.5">
+                      <span className={`font-bold ${entry.status === 'BUSY' ? 'text-brand-bronze' : 'text-gray-700'}`}>
+                        {entry.executiveName.split(' ')[0]}
+                      </span>
+                      <span className="text-gray-300 text-[9px]">
+                        {new Date(entry.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </span>
+                    </div>
+                    {entry.toExecutiveName && (
+                      <div className="flex items-center space-x-1 text-[9px] text-gray-400 mb-0.5">
+                        <ArrowRight className="w-2.5 h-2.5" />
+                        <span>{entry.toExecutiveName.split(' ')[0]}</span>
+                      </div>
+                    )}
+                    <p className="text-gray-500 leading-snug truncate">{entry.action}</p>
+                  </motion.div>
+                ))
+              )}
+            </div>
+          </div>
         </div>
       </div>
 
-      {/* Selected Node Details Drawer Side Panel */}
+      {/* Agent detail drawer */}
       <AnimatePresence>
         {selectedAgent && (
           <div className="fixed inset-0 bg-black/10 backdrop-blur-xs z-50 flex justify-end">
-            {/* Backdrop click to close */}
             <div className="absolute inset-0" onClick={() => setSelectedAgent(null)} />
-
             <motion.div
               initial={{ x: '100%' }}
               animate={{ x: 0 }}
               exit={{ x: '100%' }}
-              transition={{ type: 'spring', damping: 25, stiffness: 200 }}
-              className="w-full max-w-md bg-white h-screen border-l border-gray-100 shadow-2xl relative z-10 flex flex-col justify-between"
+              transition={{ type: 'spring', damping: 28, stiffness: 220 }}
+              className="relative z-10 w-full max-w-md bg-white h-screen border-l border-gray-100 shadow-2xl flex flex-col"
             >
               {/* Header */}
               <div className="p-6 border-b border-gray-50 flex items-center justify-between">
                 <div className="flex items-center space-x-3">
-                  <Building className="w-5 h-5 text-brand-bronze" />
-                  <div>
-                    <h2 className="text-sm font-sans font-semibold text-gray-900">Department Executive Panel</h2>
-                    <p className="text-[10px] font-mono text-brand-bronze font-medium uppercase tracking-wider">
-                      {selectedAgent.department}
-                    </p>
-                  </div>
-                </div>
-                <button
-                  onClick={() => setSelectedAgent(null)}
-                  className="p-1.5 hover:bg-gray-50 rounded-lg text-gray-400 hover:text-black transition-colors"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              {/* Main Profile Body */}
-              <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                {/* Agent Hero */}
-                <div className="flex items-center space-x-4">
                   <img
                     src={selectedAgent.avatar}
                     alt={selectedAgent.name}
                     referrerPolicy="no-referrer"
-                    className="w-16 h-16 rounded-xl object-cover border border-gray-100 shadow-sm"
+                    className="w-10 h-10 rounded-xl object-cover border border-gray-100"
                   />
                   <div>
-                    <h3 className="text-sm font-bold text-gray-900">{selectedAgent.name}</h3>
-                    <p className="text-xs text-brand-bronze font-mono uppercase tracking-wider">{selectedAgent.role}</p>
-                    <span
-                      className={`inline-flex items-center space-x-1 text-[9px] font-mono px-2 py-0.5 rounded-md mt-1.5 ${
-                        selectedAgent.status === 'In Process'
-                          ? 'bg-amber-50 text-amber-700 animate-pulse font-bold'
-                          : 'bg-emerald-50 text-emerald-700'
-                      }`}
-                    >
-                      <span>●</span>
-                      <span>{selectedAgent.status}</span>
-                    </span>
+                    <h2 className="text-sm font-semibold text-gray-900">{selectedAgent.name}</h2>
+                    <p className="text-[10px] font-mono text-brand-bronze uppercase tracking-wider">{selectedAgent.role}</p>
                   </div>
                 </div>
+                <button onClick={() => setSelectedAgent(null)} className="p-1.5 hover:bg-gray-50 rounded-lg text-gray-400 hover:text-black">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
 
-                {/* Agent Bio Statement */}
-                <div className="p-4 bg-gray-50/50 rounded-xl border border-gray-100 space-y-1">
-                  <h4 className="text-[10px] font-mono text-brand-bronze font-bold uppercase tracking-widest">Biography</h4>
-                  <p className="text-xs text-gray-600 leading-relaxed font-sans">{selectedAgent.bio}</p>
+              <div className="flex-1 overflow-y-auto p-6 space-y-5">
+                {/* Live status */}
+                <div className={`p-4 rounded-xl border space-y-2 ${liveData?.status === 'BUSY' ? 'bg-brand-bronze/5 border-brand-bronze/20' : 'bg-gray-50 border-gray-100'}`}>
+                  <div className="flex items-center space-x-2">
+                    <div className={`w-2 h-2 rounded-full ${liveData?.status === 'BUSY' ? 'bg-brand-bronze animate-pulse' : liveData?.status === 'ACTIVE' ? 'bg-emerald-500 animate-pulse' : 'bg-gray-300'}`} />
+                    <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-gray-600">
+                      {liveData?.status ?? selectedAgent.status}
+                    </span>
+                  </div>
+                  {liveData?.action && (
+                    <p className="text-xs text-gray-700 leading-relaxed">{liveData.action}</p>
+                  )}
+                  {liveData?.toExecutiveName && (
+                    <div className="flex items-center space-x-1.5 text-[10px] text-brand-bronze font-mono">
+                      <ArrowRight className="w-3 h-3" />
+                      <span>Exchanging with {liveData.toExecutiveName}</span>
+                    </div>
+                  )}
+                  {!liveData && (
+                    <p className="text-[11px] text-gray-400">{selectedAgent.lastAction}</p>
+                  )}
                 </div>
 
-                {/* Active Goals */}
-                <div className="space-y-2">
-                  <h4 className="text-[10px] font-mono text-brand-bronze font-bold uppercase tracking-widest">Active Objectives</h4>
-                  <div className="space-y-2">
-                    {selectedAgent.goals.map((goal, idx) => (
-                      <div key={idx} className="flex items-start space-x-2 text-xs text-gray-700 font-sans">
-                        <span className="text-brand-bronze font-bold mt-0.5">▪</span>
+                {/* Metrics */}
+                <div className="grid grid-cols-3 gap-3">
+                  {[
+                    { label: 'Tasks Done', value: selectedAgent.metrics.tasksCompleted },
+                    { label: 'Decisions', value: selectedAgent.metrics.decisionsMade },
+                    { label: 'Value', value: `$${selectedAgent.metrics.valueGenerated.toLocaleString()}` },
+                  ].map((m) => (
+                    <div key={m.label} className="p-3 bg-white border border-gray-100 rounded-xl text-center">
+                      <p className="text-[8px] font-mono text-gray-400 uppercase tracking-wider">{m.label}</p>
+                      <p className="text-sm font-mono font-bold text-gray-900 mt-1">{m.value}</p>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Recent activity for this agent */}
+                <div>
+                  <h4 className="text-[10px] font-mono text-brand-bronze font-bold uppercase tracking-widest mb-2">
+                    Recent Activity
+                  </h4>
+                  {agentLog.length === 0 ? (
+                    <p className="text-[11px] text-gray-400 bg-gray-50 border border-gray-100 rounded-xl p-4 text-center">
+                      No activity recorded yet for this session.
+                    </p>
+                  ) : (
+                    <div className="space-y-1.5 max-h-56 overflow-y-auto">
+                      {agentLog.map((entry) => (
+                        <div key={entry.id} className="px-3 py-2 bg-gray-50 border border-gray-100 rounded-lg">
+                          <div className="flex items-center justify-between mb-0.5">
+                            <span className={`text-[9px] font-mono font-bold uppercase ${entry.status === 'BUSY' ? 'text-brand-bronze' : 'text-gray-500'}`}>
+                              {entry.status}
+                            </span>
+                            <span className="text-[9px] font-mono text-gray-300">
+                              {new Date(entry.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                            </span>
+                          </div>
+                          {entry.toExecutiveName && (
+                            <div className="flex items-center space-x-1 text-[9px] text-brand-bronze mb-0.5">
+                              <ArrowRight className="w-2.5 h-2.5" />
+                              <span>{entry.toExecutiveName}</span>
+                            </div>
+                          )}
+                          <p className="text-[11px] text-gray-600 leading-snug">{entry.action}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Goals */}
+                <div>
+                  <h4 className="text-[10px] font-mono text-brand-bronze font-bold uppercase tracking-widest mb-2">Active Objectives</h4>
+                  <div className="space-y-1.5">
+                    {selectedAgent.goals.map((goal, i) => (
+                      <div key={i} className="flex items-start space-x-2 text-xs text-gray-600">
+                        <CheckCircle2 className="w-3 h-3 text-brand-bronze mt-0.5 shrink-0" />
                         <span>{goal}</span>
                       </div>
                     ))}
                   </div>
                 </div>
-
-                {/* Available Tools */}
-                <div className="space-y-2">
-                  <h4 className="text-[10px] font-mono text-brand-bronze font-bold uppercase tracking-widest font-sans">Available System Tools</h4>
-                  <div className="flex flex-wrap gap-1.5">
-                    {selectedAgent.tools.map((tool, idx) => (
-                      <span key={idx} className="px-2.5 py-1 bg-gray-50 border border-gray-100 text-[10px] font-mono font-medium rounded-md text-gray-600">
-                        {tool}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Monthly Metrics Performance */}
-                <div className="space-y-3">
-                  <h4 className="text-[10px] font-mono text-brand-bronze font-bold uppercase tracking-widest">Monthly Productivity Indicators</h4>
-                  <div className="grid grid-cols-3 gap-3">
-                    <div className="p-3 bg-white border border-gray-100 rounded-xl text-center">
-                      <p className="text-[9px] font-mono text-gray-400 uppercase tracking-wider">Completed Tasks</p>
-                      <p className="text-lg font-mono font-bold text-gray-900 mt-1">{selectedAgent.metrics.tasksCompleted}</p>
-                    </div>
-                    <div className="p-3 bg-white border border-gray-100 rounded-xl text-center">
-                      <p className="text-[9px] font-mono text-gray-400 uppercase tracking-wider">Decisions Filed</p>
-                      <p className="text-lg font-mono font-bold text-gray-900 mt-1">{selectedAgent.metrics.decisionsMade}</p>
-                    </div>
-                    <div className="p-3 bg-white border border-gray-100 rounded-xl text-center">
-                      <p className="text-[9px] font-mono text-gray-400 uppercase tracking-wider">Value Generated</p>
-                      <p className="text-sm font-mono font-bold text-brand-bronze mt-1.5">
-                        ${selectedAgent.metrics.valueGenerated.toLocaleString()}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Status footer */}
-              <div className="p-4 border-t border-gray-50 bg-gray-50/40 text-[9px] font-mono text-gray-400 flex justify-between">
-                <span>ACTIVE WORKFORCE REGISTER</span>
-                <span className="text-emerald-600 font-bold">SECURE PIPELINE</span>
               </div>
             </motion.div>
           </div>

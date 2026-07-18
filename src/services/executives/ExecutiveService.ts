@@ -278,10 +278,51 @@ export class ExecutiveService {
   // ─── Executive Status ──────────────────────────────────────────────────────
 
   async setStatus(status: 'IDLE' | 'ACTIVE' | 'BUSY' | 'OFFLINE', lastAction?: string) {
-    return prisma.aIExecutive.update({
+    const result = await prisma.aIExecutive.update({
       where: { id: this.executiveId },
       data: { status, lastAction, updatedAt: new Date() },
     });
+
+    // Broadcast real-time agent activity to the pulse canvas
+    if (sseBroadcaster) {
+      sseBroadcaster({
+        type: 'agent_activity',
+        data: {
+          executiveId: this.executiveId,
+          executiveName: this.executiveName,
+          organizationId: this.organizationId,
+          status,
+          action: lastAction ?? null,
+          toExecutiveId: null,
+          toExecutiveName: null,
+          ts: new Date().toISOString(),
+        },
+      });
+    }
+
+    return result;
+  }
+
+  // ─── Data Exchange — broadcast a real inter-executive data transfer ─────────
+  // Call this when one executive explicitly sends data/requests to another.
+  // Drives the real particle animations in OrganizationPulse.
+
+  broadcastDataExchange(toExecutiveId: string, toExecutiveName: string, action: string) {
+    if (sseBroadcaster) {
+      sseBroadcaster({
+        type: 'agent_activity',
+        data: {
+          executiveId: this.executiveId,
+          executiveName: this.executiveName,
+          organizationId: this.organizationId,
+          status: 'BUSY',
+          action,
+          toExecutiveId,
+          toExecutiveName,
+          ts: new Date().toISOString(),
+        },
+      });
+    }
   }
 
   async incrementTaskCount(valueGenerated = 0) {

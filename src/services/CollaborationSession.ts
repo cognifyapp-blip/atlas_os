@@ -25,6 +25,7 @@
 import OpenAI from 'openai';
 import { prisma } from '../lib/prisma.js';
 import { eventBus } from './EventBus.js';
+import { broadcastSSE } from './SSEBridge.js';
 
 // ─── AI Client (reuse env config) ────────────────────────────────────────────
 
@@ -174,6 +175,29 @@ Keep your response under 200 words.`;
     const answer = completion.choices[0]?.message?.content ?? 'No response generated.';
     const timestamp = new Date().toISOString();
 
+    // Broadcast real inter-executive data exchange → drives OrganizationPulse particles
+    const fromExecRecord = await prisma.aIExecutive.findFirst({
+      where: { organizationId: params.organizationId, name: { contains: params.from.split(' ')[0], mode: 'insensitive' } },
+    });
+    const toExecRecordForBroadcast = await prisma.aIExecutive.findFirst({
+      where: { organizationId: params.organizationId, name: { contains: params.to.split(' ')[0], mode: 'insensitive' } },
+    });
+    if (fromExecRecord && toExecRecordForBroadcast) {
+      broadcastSSE({
+        type: 'agent_activity',
+        data: {
+          executiveId: fromExecRecord.id,
+          executiveName: params.from,
+          organizationId: params.organizationId,
+          status: 'BUSY',
+          action: `Messaging ${params.to}: "${params.question.substring(0, 60)}${params.question.length > 60 ? '…' : ''}"`,
+          toExecutiveId: toExecRecordForBroadcast.id,
+          toExecutiveName: params.to,
+          ts: timestamp,
+        },
+      });
+    }
+
     // Persist as memory if requested (default: yes)
     if (params.persist !== false) {
       const execRecord = await prisma.aIExecutive.findFirst({
@@ -246,6 +270,29 @@ Keep your statement under 150 words.`;
 
       const message = completion.choices[0]?.message?.content ?? 'No response.';
       transcript.push({ speaker: participant, message });
+
+      // Broadcast each participant speaking to the convener → real particle
+      const participantExec = await prisma.aIExecutive.findFirst({
+        where: { organizationId: params.organizationId, name: { contains: participant.split(' ')[0], mode: 'insensitive' } },
+      });
+      const convenerExec = await prisma.aIExecutive.findFirst({
+        where: { organizationId: params.organizationId, name: { contains: params.convener.split(' ')[0], mode: 'insensitive' } },
+      });
+      if (participantExec && convenerExec) {
+        broadcastSSE({
+          type: 'agent_activity',
+          data: {
+            executiveId: participantExec.id,
+            executiveName: participant,
+            organizationId: params.organizationId,
+            status: 'BUSY',
+            action: `In session: "${params.topic.substring(0, 50)}${params.topic.length > 50 ? '…' : ''}"`,
+            toExecutiveId: convenerExec.id,
+            toExecutiveName: params.convener,
+            ts: new Date().toISOString(),
+          },
+        });
+      }
     }
 
     // Convener synthesizes and forms consensus
