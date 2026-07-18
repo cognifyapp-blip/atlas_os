@@ -21,6 +21,7 @@ import { LayoutDashboard, Users, Clock, AlertCircle, Play, Check, X, Shield, Ref
 import CollaborationView from './components/CollaborationView';
 import GovernancePanel from './components/GovernancePanel';
 import MissionGoalsView from './components/MissionGoalsView';
+import IntegrationsPanel from './components/IntegrationsPanel';
 
 export default function App() {
   // Clerk auth — gracefully degrades when Clerk is not configured
@@ -572,6 +573,7 @@ export default function App() {
           {currentView === 'collaboration' && <CollaborationView />}
           {currentView === 'governance' && <GovernancePanel />}
           {currentView === 'goals' && <MissionGoalsView />}
+          {currentView === 'integrations' && <IntegrationsPanel />}
         </main>
       </div>
 

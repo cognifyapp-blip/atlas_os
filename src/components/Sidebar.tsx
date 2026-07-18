@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { LayoutDashboard, BrainCircuit, Activity, Users, DollarSign, Target, Megaphone, Library, Presentation, Sparkles, GitMerge, Shield, Crosshair } from 'lucide-react';
+import { LayoutDashboard, BrainCircuit, Activity, Users, DollarSign, Target, Megaphone, Library, Presentation, Sparkles, GitMerge, Shield, Crosshair, Plug } from 'lucide-react';
 
 interface SidebarProps {
   currentView: string;
@@ -24,6 +24,7 @@ export default function Sidebar({ currentView, onNavigate, pendingDecisionsCount
     { id: 'marketing', name: 'Marketing Studio', icon: Megaphone },
     { id: 'collaboration', name: 'Collaboration', icon: GitMerge },
     { id: 'governance', name: 'Governance', icon: Shield },
+    { id: 'integrations', name: 'Integrations', icon: Plug },
     { id: 'memory', name: 'Central Memory', icon: Library },
     { id: 'boardroom', name: 'Boardroom Mode', icon: Presentation },
   ];
