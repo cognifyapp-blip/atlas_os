@@ -18,6 +18,7 @@ import { Router, type Request, type Response } from 'express';
 import { prisma } from '../lib/prisma.js';
 import { governancePolicy } from '../services/GovernancePolicy.js';
 import { CEOAssistant } from '../services/executives/index.js';
+import { resolveOrg, resolveOrgId } from '../lib/resolveOrg.js';
 
 const router = Router();
 
@@ -25,22 +26,17 @@ function wrap(fn: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response) => {
     fn(req, res).catch((err: any) => {
       console.error(`[Governance Route Error]`, err.message);
-      res.status(500).json({ error: err.message });
+      res.status(500).json({ error: 'Request failed.' });
     });
   };
-}
-
-async function getOrg() {
-  const org = await prisma.organization.findFirst({ where: { initialized: true } });
-  if (!org) throw new Error('No initialized organization found.');
-  return org;
 }
 
 // ─── Status ──────────────────────────────────────────────────────────────────
 
 router.get('/status', wrap(async (_req, res) => {
   const mode = governancePolicy.mode;
-  const pendingCount = await prisma.decision.count({ where: { status: 'pending' } });
+  const org = await resolveOrg(res);
+  const pendingCount = await prisma.decision.count({ where: { status: 'pending', organizationId: org.id } });
 
   const modeDescriptions: Record<string, string> = {
     supervised: 'All decisions require human CEO approval. Atlas never auto-approves.',
@@ -88,7 +84,7 @@ router.post('/process/:decisionId', wrap(async (req, res) => {
 // ─── Governance log ───────────────────────────────────────────────────────────
 
 router.get('/log', wrap(async (_req, res) => {
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   const log = await prisma.memory.findMany({
     where: { organizationId: org.id, tags: { has: 'governance' } },
     orderBy: { createdAt: 'desc' },
@@ -110,7 +106,7 @@ router.get('/log', wrap(async (_req, res) => {
 // ─── Atlas manually approves ──────────────────────────────────────────────────
 
 router.post('/atlas/approve/:id', wrap(async (req, res) => {
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   const decision = await prisma.decision.findFirst({ where: { id: req.params.id, organizationId: org.id } });
   if (!decision) return res.status(404).json({ error: 'Decision not found.' });
   if (decision.status !== 'pending') return res.status(400).json({ error: `Decision is already ${decision.status}.` });
@@ -154,7 +150,7 @@ router.post('/atlas/approve/:id', wrap(async (req, res) => {
 // ─── Atlas manually declines ──────────────────────────────────────────────────
 
 router.post('/atlas/decline/:id', wrap(async (req, res) => {
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   const decision = await prisma.decision.findFirst({ where: { id: req.params.id, organizationId: org.id } });
   if (!decision) return res.status(404).json({ error: 'Decision not found.' });
 
@@ -194,7 +190,7 @@ router.post('/atlas/decline/:id', wrap(async (req, res) => {
  * In supervised mode: returns a summary without acting.
  */
 router.post('/atlas/run', wrap(async (req, res) => {
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   const pendingDecisions = await prisma.decision.findMany({
     where: { organizationId: org.id, status: 'pending' },
     orderBy: { createdAt: 'asc' },

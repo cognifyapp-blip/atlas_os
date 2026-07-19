@@ -17,6 +17,7 @@ import { Router, type Request, type Response } from 'express';
 import { prisma } from '../lib/prisma.js';
 import { collaboration } from '../services/CollaborationSession.js';
 import { AutonomousWorkflows } from '../services/AutonomousWorkflows.js';
+import { resolveOrgId } from '../lib/resolveOrg.js';
 
 const router = Router();
 
@@ -24,15 +25,9 @@ function wrap(fn: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response) => {
     fn(req, res).catch((err: any) => {
       console.error(`[Collaboration Route Error]`, err.message);
-      res.status(500).json({ error: err.message });
+      res.status(500).json({ error: 'Request failed.' });
     });
   };
-}
-
-async function getOrgId(): Promise<string> {
-  const org = await prisma.organization.findFirst({ where: { initialized: true } });
-  if (!org) throw new Error('No initialized organization found.');
-  return org.id;
 }
 
 // ─── Ask ─────────────────────────────────────────────────────────────────────
@@ -49,7 +44,7 @@ router.post('/ask', wrap(async (req, res) => {
   if (!from || !to || !question) {
     return res.status(400).json({ error: 'from, to, and question are required.' });
   }
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
   const result = await collaboration.ask({ from, to, question, context, organizationId: orgId });
   res.json(result);
 }));
@@ -68,7 +63,7 @@ router.post('/convene', wrap(async (req, res) => {
   if (!convener || !topic || !participants || !Array.isArray(participants) || participants.length < 2) {
     return res.status(400).json({ error: 'convener, topic, and participants (array, min 2) are required.' });
   }
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
   const result = await collaboration.convene({ convener, topic, participants, context, organizationId: orgId });
   res.json(result);
 }));
@@ -87,7 +82,7 @@ router.post('/delegate', wrap(async (req, res) => {
   if (!from || !to || !task || !priority) {
     return res.status(400).json({ error: 'from, to, task, and priority are required.' });
   }
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
   const result = await collaboration.delegate({ from, to, task, priority, context, dueInHours, organizationId: orgId });
   res.json(result);
 }));
@@ -106,7 +101,7 @@ router.post('/brief', wrap(async (req, res) => {
   if (!from || !to || !briefingType || !data) {
     return res.status(400).json({ error: 'from, to, briefingType, and data are required.' });
   }
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
   const result = await collaboration.briefExecutive({ from, to, briefingType, data, organizationId: orgId });
   res.json(result);
 }));
@@ -128,7 +123,7 @@ router.post('/brief', wrap(async (req, res) => {
  */
 router.post('/workflow/:name', wrap(async (req, res) => {
   const { name } = req.params;
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
   const workflows = new AutonomousWorkflows(orgId);
 
   switch (name) {
@@ -204,7 +199,7 @@ router.post('/workflow/:name', wrap(async (req, res) => {
  * Returns recent inter-executive collaboration events from the memory store.
  */
 router.get('/sessions', wrap(async (_req, res) => {
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
   const sessions = await prisma.memory.findMany({
     where: {
       organizationId: orgId,

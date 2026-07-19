@@ -4,19 +4,16 @@
  * Verifies the Clerk Bearer token on every protected route and attaches the
  * resolved AuthContext to `res.locals.auth`.
  *
- * Usage (applied once in server.ts before route registration):
- *   app.use('/api/v1', requireAuth, router)
- *
  * Public routes that don't need a token:
  *   - POST /api/v1/auth/sync       (Clerk frontend calls this on first load)
  *   - GET  /api/v1/auth/me         (used to probe login state)
- *   - POST /api/v1/onboarding      (first-boot setup before user exists in DB)
+ *   - POST /api/v1/onboarding      (first-boot setup — org doesn't exist yet)
  *   - GET  /api/v1/onboarding/context
- *   - GET  /api/v1/stream-events   (SSE — authenticated at connection level by Clerk frontend)
+ *   - GET  /api/v1/stream-events   (SSE — token verified at connection time by Clerk frontend)
  *
- * When CLERK_SECRET_KEY is not configured the middleware passes every request
- * through with a warning — this preserves the local/dev experience while
- * making it obvious auth is disabled.
+ * All other /api/v1/* routes require a valid Clerk Bearer token.
+ * If CLERK_SECRET_KEY is not set (local dev without Clerk), the middleware
+ * passes through with a warning — but logs clearly that auth is disabled.
  */
 
 import type { Request, Response, NextFunction } from 'express';
@@ -32,62 +29,40 @@ declare global {
   }
 }
 
-// Routes under /api/v1 that are reachable without a valid session.
-// When this middleware is mounted at app.use('/api/v1', requireAuth),
-// req.path will be the portion AFTER /api/v1 — e.g. '/onboarding', not '/api/v1/onboarding'.
+// Only routes that genuinely cannot require a token.
+// Everything else — leads, decisions, proposals, memories, feeds — requires auth.
 const PUBLIC_PATHS = new Set([
   '/auth/me',
   '/auth/sync',
   '/onboarding',
   '/onboarding/context',
   '/stream-events',
-  '/agents',
-  '/decisions',
-  '/decisions/history',
-  '/leads',
-  '/proposals',
-  '/memories',
-  '/workflows',
-  '/feeds',
-  '/boardroom/report',
-  '/audit/summary',
-  '/audit/recent',
-  '/scheduler/status',
-  '/infrastructure/metrics',
-  '/goals',
-  '/collaboration/sessions',
-  '/governance/status',
-  '/governance/log',
-  '/governance/policy',
-  '/memories/search',
+  '/health',
 ]);
+
+// Prefixes where all sub-paths are public (e.g. /auth/*)
+const PUBLIC_PREFIXES = ['/onboarding', '/auth'];
 
 export async function requireAuth(
   req: Request,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
-  // Normalize path — strip trailing slash and query string
   const normalizedPath = req.path.replace(/\/$/, '') || '/';
 
-  // Always pass public paths through
-  if (PUBLIC_PATHS.has(normalizedPath)) {
-    return next();
-  }
+  if (PUBLIC_PATHS.has(normalizedPath)) return next();
+  if (PUBLIC_PREFIXES.some((p) => normalizedPath.startsWith(p))) return next();
 
-  // Also pass dynamic public paths (e.g. /decisions/:id/approve uses POST auth)
-  // Wildcard check for paths that start with a public prefix
-  const isPublicPrefix = ['/onboarding', '/auth', '/stream-events'].some(
-    (prefix) => normalizedPath.startsWith(prefix),
-  );
-  if (isPublicPrefix) {
-    return next();
-  }
-
-  // If Clerk is not configured OR we're not in strict production mode,
-  // pass through. For a single-user deployment, auth is handled by
-  // keeping the URL private rather than token verification.
-  if (!process.env.CLERK_SECRET_KEY || process.env.CLERK_AUTH_STRICT !== 'true') {
+  // If Clerk is not configured (local dev / no CLERK_SECRET_KEY), pass through
+  // with a clear warning so developers know auth is disabled.
+  if (!process.env.CLERK_SECRET_KEY) {
+    if (!globalThis._authWarnedOnce) {
+      console.warn(
+        '[requireAuth] WARNING: CLERK_SECRET_KEY not set. Auth is DISABLED. ' +
+        'Set CLERK_SECRET_KEY in production or all routes are publicly accessible.',
+      );
+      (globalThis as any)._authWarnedOnce = true;
+    }
     return next();
   }
 
@@ -104,7 +79,6 @@ export async function requireAuth(
       res.status(status).json({ error: err.message, code: err.code });
       return;
     }
-    // Unexpected error — don't leak internals
     res.status(500).json({ error: 'Authentication check failed.' });
   }
 }

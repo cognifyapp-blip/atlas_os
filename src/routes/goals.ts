@@ -19,6 +19,7 @@ import { Router, type Request, type Response } from 'express';
 import { prisma } from '../lib/prisma.js';
 import { missionControl } from '../services/MissionControl.js';
 import { outboundEngine } from '../services/OutboundEngine.js';
+import { resolveOrg, resolveOrgId } from '../lib/resolveOrg.js';
 
 const router = Router();
 
@@ -26,15 +27,9 @@ function wrap(fn: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response) => {
     fn(req, res).catch((err: any) => {
       console.error(`[Goals Route Error]`, err.message);
-      res.status(500).json({ error: err.message });
+      res.status(500).json({ error: 'Request failed.' });
     });
   };
-}
-
-async function getOrg() {
-  const org = await prisma.organization.findFirst({ where: { initialized: true } });
-  if (!org) throw new Error('No initialized organization found.');
-  return org;
 }
 
 // ─── Goals ───────────────────────────────────────────────────────────────────
@@ -43,7 +38,7 @@ router.post('/goals', wrap(async (req, res) => {
   const { title, description, targetDate, successCriteria, weeksToTarget } = req.body;
   if (!title) return res.status(400).json({ error: 'title is required' });
 
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   const plan = await missionControl.setGoal({
     organizationId: org.id,
     title,
@@ -57,13 +52,13 @@ router.post('/goals', wrap(async (req, res) => {
 }));
 
 router.get('/goals', wrap(async (_req, res) => {
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   const goals = await missionControl.getActiveGoals(org.id);
   res.json({ goals });
 }));
 
 router.get('/goals/:id', wrap(async (req, res) => {
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   const goal = await prisma.missionGoal.findFirst({
     where: { id: req.params.id, organizationId: org.id },
     include: {
@@ -78,14 +73,14 @@ router.get('/goals/:id', wrap(async (req, res) => {
 }));
 
 router.post('/goals/:id/milestones/:mid/complete', wrap(async (req, res) => {
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   const { notes } = req.body;
   await missionControl.completeMilestone(req.params.mid, org.id, notes);
   res.json({ success: true });
 }));
 
 router.delete('/goals/:id', wrap(async (req, res) => {
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   await prisma.missionGoal.updateMany({
     where: { id: req.params.id, organizationId: org.id },
     data: { status: 'cancelled', updatedAt: new Date() },
@@ -102,7 +97,7 @@ router.post('/outbound/campaign', wrap(async (req, res) => {
     return res.status(400).json({ error: 'icp must include: industry, companySize, jobTitles[], painPoints[]' });
   }
 
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   const result = await outboundEngine.runCampaign({
     organizationId: org.id,
     campaignName,
@@ -119,7 +114,7 @@ router.post('/outbound/prospects', wrap(async (req, res) => {
   const { icp, count } = req.body;
   if (!icp) return res.status(400).json({ error: 'icp is required' });
 
-  const org = await getOrg();
+  const org = await resolveOrg(res);
   const prospects = await outboundEngine.generateProspects({
     org: { name: org.name, industry: org.industry ?? '', goals: org.goals ?? '' },
     icp,

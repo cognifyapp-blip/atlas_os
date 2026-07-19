@@ -191,6 +191,15 @@ Return JSON:
 
     const org = await this.getOrgContext();
 
+    // Research the company in real-time before drafting so the email is grounded
+    let companyContext = '';
+    if (lead.company) {
+      companyContext = await this.webSearch(
+        `${lead.company} company ${lead.company} news recent`,
+        { numResults: 4, timeRange: 'qdr:m' },
+      );
+    }
+
     const result = await this.generateJSON<{
       subject: string;
       body: string;
@@ -207,9 +216,11 @@ Draft a ${type === 'initial' ? 'first-touch outreach' : type === 'follow_up' ? '
 
 Our company: ${org?.name}, ${org?.industry} industry.
 
+${companyContext ? `Real-time intelligence on ${lead.company}:\n${companyContext}\n\nUse this intelligence to make the email highly specific and relevant.` : ''}
+
 Write a concise, professional, personalized email that:
 - Feels human (not template-like)
-- References their specific situation
+- References their specific situation or a recent company development if available
 - Has a single clear call to action
 - Is under 150 words
 

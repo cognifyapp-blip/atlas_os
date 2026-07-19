@@ -18,6 +18,7 @@ import { Router, type Request, type Response } from 'express';
 import { prisma } from '../lib/prisma.js';
 import { integrationRegistry } from '../integrations/IntegrationRegistry.js';
 import { integrationManager } from '../integrations/IntegrationManager.js';
+import { resolveOrgId } from '../lib/resolveOrg.js';
 
 const router = Router();
 
@@ -25,21 +26,15 @@ function wrap(fn: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response) => {
     fn(req, res).catch((err: any) => {
       console.error(`[Integration Route Error]`, err.message);
-      res.status(500).json({ error: err.message });
+      res.status(500).json({ error: 'Request failed.' });
     });
   };
-}
-
-async function getOrgId(): Promise<string> {
-  const org = await prisma.organization.findFirst({ where: { initialized: true } });
-  if (!org) throw new Error('No initialized organization found.');
-  return org.id;
 }
 
 // ─── List all integrations ────────────────────────────────────────────────────
 
 router.get('/', wrap(async (_req, res) => {
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
   const providers = integrationRegistry.listAll();
 
   const dbIntegrations = await prisma.integration.findMany({
@@ -115,7 +110,7 @@ router.get('/:provider/callback', wrap(async (req, res) => {
     return res.status(400).json({ error: 'Authorization code missing.' });
   }
 
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
 
   if (!integrationRegistry.has(provider)) {
     return res.status(404).json({ error: `Provider "${provider}" not registered.` });
@@ -146,7 +141,7 @@ router.get('/:provider/callback', wrap(async (req, res) => {
 
 router.post('/:provider/disconnect', wrap(async (req, res) => {
   const { provider } = req.params;
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
 
   const dbRecord = await prisma.integration.findFirst({ where: { organizationId: orgId, provider } });
   if (!dbRecord) return res.status(404).json({ error: `Integration "${provider}" not found.` });
@@ -162,7 +157,7 @@ router.post('/:provider/disconnect', wrap(async (req, res) => {
 
 router.get('/:provider/status', wrap(async (req, res) => {
   const { provider } = req.params;
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
 
   if (!integrationRegistry.has(provider)) {
     return res.status(404).json({ error: `Provider "${provider}" not registered.` });
@@ -180,7 +175,7 @@ router.get('/:provider/status', wrap(async (req, res) => {
 router.post('/:provider/sync', wrap(async (req, res) => {
   const { provider } = req.params;
   const { mode = 'incremental' } = req.body;
-  const orgId = await getOrgId();
+  const orgId = await resolveOrgId(res);
 
   const dbRecord = await prisma.integration.findFirst({ where: { organizationId: orgId, provider } });
   if (!dbRecord) return res.status(404).json({ error: `Integration "${provider}" not connected.` });

@@ -406,6 +406,19 @@ Return JSON:
 
     const org = await this.getOrgContext();
 
+    // Search for real competitive intelligence before asking the LLM
+    const searchQueries = [
+      `${org?.name ?? ''} competitors ${org?.industry ?? ''} 2024`,
+      ...(params.competitors ?? []).slice(0, 2).map((c) => `${c} company reviews pricing ${org?.industry}`),
+      `${org?.industry ?? ''} market leaders trends 2024`,
+    ];
+
+    const searchResults = await Promise.all(
+      searchQueries.map((q) => this.webSearch(q, { numResults: 5, timeRange: 'qdr:y' })),
+    );
+
+    const searchContext = searchResults.join('\n\n---\n\n');
+
     const result = await this.generateJSON<{
       summary: string;
       positioning: string;
@@ -431,9 +444,12 @@ Analyze the competitive landscape:
 
 Our goals: ${org?.goals ?? 'Growth and market expansion'}
 
+REAL-TIME WEB INTELLIGENCE (use this to ground your analysis in current facts):
+${searchContext}
+
 Return a comprehensive competitive analysis in JSON:
 {
-  "summary": "2-3 paragraph competitive landscape summary",
+  "summary": "2-3 paragraph competitive landscape summary grounded in the web data above",
   "positioning": "How we are positioned relative to competitors",
   "competitors": [
     {
@@ -462,6 +478,176 @@ Return a comprehensive competitive analysis in JSON:
     await this.pushFeed('Competitive Analysis Complete', `${result.competitors.length} competitors analyzed. ${result.opportunities.length} opportunities identified.`, 'info');
     await this.incrementTaskCount();
     await this.setStatus('IDLE', 'Competitive analysis complete.');
+
+    return result;
+  }
+
+  // ─── Market News Monitoring ──────────────────────────────────────────────────
+  // Searches Google News for industry trends, competitor moves, and market signals.
+
+  async monitorMarketNews(params: {
+    topics?: string[];       // specific topics to monitor (defaults to org industry)
+    timeRange?: 'qdr:d' | 'qdr:w' | 'qdr:m';
+    numArticles?: number;
+  } = {}) {
+    await this.setStatus('ACTIVE', 'Monitoring market news and signals');
+
+    const org = await this.getOrgContext();
+    const industry = org?.industry ?? 'technology';
+    const timeRange = params.timeRange ?? 'qdr:w';
+
+    const topicsToSearch = params.topics ?? [
+      `${industry} industry news`,
+      `${industry} market trends`,
+      `${org?.name ?? industry} competitors`,
+    ];
+
+    const newsResults = await Promise.all(
+      topicsToSearch.map((topic) =>
+        this.searchNews(topic, { numResults: params.numArticles ?? 5, timeRange }),
+      ),
+    );
+
+    const allNews = newsResults.join('\n\n---\n\n');
+
+    const result = await this.generateJSON<{
+      headline: string;
+      summary: string;
+      signals: Array<{
+        type: 'opportunity' | 'threat' | 'trend' | 'competitor_move';
+        title: string;
+        description: string;
+        urgency: 'low' | 'medium' | 'high';
+        recommendedAction: string;
+        source?: string;
+      }>;
+      keyDevelopments: string[];
+      recommendationsForCEO: string[];
+    }>(`
+You are Iris, Intelligence AI for ${org?.name ?? 'the company'} (${industry} industry).
+
+Analyze the following real-time market news and extract strategic intelligence:
+
+${allNews}
+
+Return JSON:
+{
+  "headline": "Single most important market development this ${timeRange === 'qdr:d' ? 'day' : timeRange === 'qdr:w' ? 'week' : 'month'}",
+  "summary": "2-3 paragraph synthesis of the market landscape based on these news items",
+  "signals": [
+    {
+      "type": "opportunity" | "threat" | "trend" | "competitor_move",
+      "title": "Signal title",
+      "description": "What this means for ${org?.name ?? 'us'}",
+      "urgency": "low" | "medium" | "high",
+      "recommendedAction": "Specific action to take",
+      "source": "Publication or source name"
+    }
+    ... (extract all meaningful signals from the news)
+  ],
+  "keyDevelopments": ["3-5 most important things that happened"],
+  "recommendationsForCEO": ["3-5 strategic recommendations based on this news"]
+}
+`);
+
+    // File a decision for high-urgency signals
+    for (const signal of result.signals.filter((s) => s.urgency === 'high')) {
+      await this.createDecision({
+        title: `Market Signal: ${signal.title}`,
+        summary: signal.description,
+        reasoning: `Detected via real-time market monitoring. Type: ${signal.type}`,
+        impact: signal.recommendedAction,
+        confidence: 75,
+        type: signal.type === 'threat' ? 'strategic' : 'general',
+        expiresInHours: 48,
+      });
+    }
+
+    await this.rememberText(
+      `Market News Brief: ${result.headline}\n\n${result.summary}`,
+      'insight',
+      ['intelligence', 'market-news', 'monitoring', industry.toLowerCase().replace(/\s+/g, '-')],
+    );
+
+    await this.pushFeed(
+      'Market Intelligence Brief',
+      result.headline,
+      result.signals.some((s) => s.type === 'threat' && s.urgency === 'high') ? 'warning' : 'info',
+    );
+
+    await this.incrementTaskCount();
+    await this.setStatus('IDLE', 'Market news monitoring complete.');
+
+    return result;
+  }
+
+  // ─── Research a specific company ─────────────────────────────────────────────
+  // Deep-dives on a specific company using real web search.
+
+  async researchCompany(companyName: string) {
+    await this.setStatus('ACTIVE', `Researching ${companyName}`);
+
+    const org = await this.getOrgContext();
+
+    const [overviewData, newsData, placesData] = await Promise.all([
+      this.webSearch(`${companyName} company overview products revenue employees`, { numResults: 8 }),
+      this.searchNews(`${companyName}`, { numResults: 5, timeRange: 'qdr:m' }),
+      this.searchPlaces(companyName),
+    ]);
+
+    const result = await this.generateJSON<{
+      companyName: string;
+      overview: string;
+      industry: string;
+      estimatedSize: string;
+      keyProducts: string[];
+      recentDevelopments: string[];
+      decisionMakers: string[];
+      painPoints: string[];
+      opportunityForUs: string;
+      relevanceScore: number;
+      outreachAngle: string;
+    }>(`
+You are Iris, Intelligence AI for ${org?.name ?? 'our company'}.
+
+Research this company and extract intelligence relevant to our sales and partnership efforts:
+
+Company: ${companyName}
+
+Web search results:
+${overviewData}
+
+Recent news:
+${newsData}
+
+Location data:
+${placesData}
+
+Return JSON:
+{
+  "companyName": "${companyName}",
+  "overview": "2-3 sentence company summary",
+  "industry": "Primary industry",
+  "estimatedSize": "Employee count range or revenue tier",
+  "keyProducts": ["Their main products or services"],
+  "recentDevelopments": ["Key recent news or changes"],
+  "decisionMakers": ["Likely decision maker titles to target"],
+  "painPoints": ["Likely pain points our company could address"],
+  "opportunityForUs": "Why they're a good prospect for ${org?.name ?? 'us'}",
+  "relevanceScore": (0-100, how relevant is this company as a prospect or partner?),
+  "outreachAngle": "Best personalized outreach angle for this company"
+}
+`);
+
+    await this.rememberText(
+      `Company research: ${companyName}. ${result.overview} Relevance score: ${result.relevanceScore}/100. Outreach angle: ${result.outreachAngle}`,
+      'insight',
+      ['intelligence', 'company-research', companyName.toLowerCase().replace(/\s+/g, '-')],
+    );
+
+    await this.pushFeed('Company Research Complete', `${companyName} researched. Relevance: ${result.relevanceScore}/100`, 'info');
+    await this.incrementTaskCount();
+    await this.setStatus('IDLE', `Research complete for ${companyName}.`);
 
     return result;
   }

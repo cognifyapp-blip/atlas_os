@@ -9,6 +9,7 @@
 import { prisma } from '../../lib/prisma.js';
 import OpenAI from 'openai';
 import { Prisma } from '@prisma/client';
+import { webSearchService, WebSearchService } from '../WebSearchService.js';
 
 // ─── AI Client ────────────────────────────────────────────────────────────────
 
@@ -359,4 +360,79 @@ export class ExecutiveService {
       include: { department: true },
     });
   }
+
+  // ─── Web Search ────────────────────────────────────────────────────────────
+  // All executives can search the web. Results are fed into LLM prompts so
+  // the executive can synthesize them into domain-specific insights.
+  // Requires SERPER_API_KEY to be set — no-ops gracefully if not configured.
+
+  /**
+   * Search the web (Google) and return formatted results for prompt injection.
+   * Use this when an executive needs current information that isn't in the DB.
+   *
+   * @example
+   * const results = await this.webSearch('HubSpot CRM pricing 2024');
+   * // Then inject results into generateJSON/generateText prompt
+   */
+  protected async webSearch(
+    query: string,
+    options: {
+      numResults?: number;
+      timeRange?: 'qdr:h' | 'qdr:d' | 'qdr:w' | 'qdr:m' | 'qdr:y';
+      country?: string;
+    } = {},
+  ): Promise<string> {
+    if (!WebSearchService.isConfigured()) {
+      return `[Web search unavailable — set SERPER_API_KEY to enable real-time search for query: "${query}"]`;
+    }
+    try {
+      const results = await webSearchService.search(query, options);
+      return WebSearchService.formatForPrompt(results);
+    } catch (err: any) {
+      console.error(`[${this.executiveName}] Web search failed for "${query}": ${err.message}`);
+      return `[Web search failed for "${query}": ${err.message}]`;
+    }
+  }
+
+  /**
+   * Search Google News and return formatted articles for prompt injection.
+   * Ideal for market monitoring, competitor news, industry trends.
+   */
+  protected async searchNews(
+    query: string,
+    options: {
+      numResults?: number;
+      timeRange?: 'qdr:h' | 'qdr:d' | 'qdr:w' | 'qdr:m';
+    } = {},
+  ): Promise<string> {
+    if (!WebSearchService.isConfigured()) {
+      return `[News search unavailable — set SERPER_API_KEY to enable for query: "${query}"]`;
+    }
+    try {
+      const results = await webSearchService.searchNews(query, options);
+      return WebSearchService.formatNewsForPrompt(results);
+    } catch (err: any) {
+      console.error(`[${this.executiveName}] News search failed for "${query}": ${err.message}`);
+      return `[News search failed for "${query}": ${err.message}]`;
+    }
+  }
+
+  /**
+   * Search Google Maps / local places.
+   * Useful for market research, finding local competitors, or researching
+   * a prospect's physical presence before outreach.
+   */
+  protected async searchPlaces(query: string, location?: string): Promise<string> {
+    if (!WebSearchService.isConfigured()) {
+      return `[Places search unavailable — set SERPER_API_KEY to enable for query: "${query}"]`;
+    }
+    try {
+      const results = await webSearchService.searchPlaces(query, location);
+      return WebSearchService.formatPlacesForPrompt(results);
+    } catch (err: any) {
+      console.error(`[${this.executiveName}] Places search failed for "${query}": ${err.message}`);
+      return `[Places search failed for "${query}": ${err.message}]`;
+    }
+  }
+
 }

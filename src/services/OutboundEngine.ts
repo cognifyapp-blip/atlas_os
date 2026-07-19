@@ -8,13 +8,11 @@
  * Zephyr creates lead records and drafts personalised outreach.
  * EmailService sends the emails when configured.
  *
- * This does NOT scrape the web (no browser). It uses the LLM to generate
- * realistic, high-quality synthetic prospect lists based on ICP criteria,
- * then creates real lead records and real outreach emails.
- *
- * In production with Apollo.io, Hunter.io, or Clay integration, replace
- * generateProspects() with a real API call — the rest of the pipeline is
- * identical.
+ * Prospect sourcing strategy (in priority order):
+ *   1. Apollo.io (APOLLO_API_KEY set) — real people from 240M+ contact DB.
+ *      Step 1: People Search (free) → Step 2: Bulk Enrichment (credits).
+ *   2. LLM fallback (no APOLLO_API_KEY) — AI-generated fictional prospects.
+ *      Good for demos/testing. Replace with Apollo for production.
  */
 
 import OpenAI from 'openai';
@@ -23,6 +21,7 @@ import { SalesAI } from './executives/SalesAI.js';
 import { MarketingAI } from './executives/MarketingAI.js';
 import { emailService } from './EmailService.js';
 import { eventBus } from './EventBus.js';
+import { ApolloService } from './ApolloService.js';
 
 function createAIClient(): OpenAI | null {
   const provider = process.env.AI_PROVIDER || 'openrouter';
@@ -188,12 +187,12 @@ class AtlasOutboundEngine {
               body: emailDraft.body,
             });
 
-            if (sendResult.success) {
+            if (sendResult.success && !sendResult.logged) {
               emailsSent++;
               await prisma.lead.update({
                 where: { id: lead.id },
                 data: {
-                  status: 'proposal_sent',
+                  status: 'new',  // outreach sent but still needs qualification — not a proposal
                   metadata: {
                     ...((lead.metadata as any) ?? {}),
                     outreachSent: true,
@@ -254,23 +253,28 @@ class AtlasOutboundEngine {
       });
     }
 
-    // Publish event — kicks off qualification flow for high-score prospects
-    for (const leadId of leadIds) {
-      try {
-        if (zephyrExec) {
-          const zephyr = new SalesAI(params.organizationId, zephyrExec.id);
-          const { qualification } = await zephyr.qualifyLead(leadId);
-          if (qualification.score >= 70) {
-            eventBus.publish('lead.qualified', {
-              organizationId: params.organizationId,
-              leadId,
-              score: qualification.score,
-              estimatedValue: qualification.estimatedValue,
-              executiveId: zephyrExec.id,
-            });
-          }
-        }
-      } catch { /* qualification errors are non-fatal */ }
+    // Qualify all leads in parallel (max 5 concurrent to avoid LLM rate limits)
+    const QUALIFY_CONCURRENCY = 5;
+    for (let i = 0; i < leadIds.length; i += QUALIFY_CONCURRENCY) {
+      const batch = leadIds.slice(i, i + QUALIFY_CONCURRENCY);
+      await Promise.allSettled(
+        batch.map(async (leadId) => {
+          try {
+            if (!zephyrExec) return;
+            const zephyr = new SalesAI(params.organizationId, zephyrExec.id);
+            const { qualification } = await zephyr.qualifyLead(leadId);
+            if (qualification.score >= 70) {
+              eventBus.publish('lead.qualified', {
+                organizationId: params.organizationId,
+                leadId,
+                score: qualification.score,
+                estimatedValue: qualification.estimatedValue,
+                executiveId: zephyrExec.id,
+              });
+            }
+          } catch { /* qualification errors are non-fatal */ }
+        }),
+      );
     }
 
     return {
@@ -284,16 +288,42 @@ class AtlasOutboundEngine {
     };
   }
 
-  // ─── Generate prospect list via LLM ───────────────────────────────────────
-  // Returns realistic fictional prospects matching the ICP.
-  // Replace with Apollo.io/Hunter.io/Clay API in production for real contacts.
+  // ─── Generate prospect list ────────────────────────────────────────────────
+  // Uses Apollo.io if APOLLO_API_KEY is set (real people, real emails).
+  // Falls back to LLM-generated fictional prospects for demos/testing.
 
   async generateProspects(params: {
     org: { name: string; industry: string; goals: string };
     icp: ICPDefinition;
     count: number;
   }): Promise<ProspectRecord[]> {
-    if (!aiClient) throw new Error('No AI provider configured.');
+
+    // ── Apollo path (production) ────────────────────────────────────────────
+    if (ApolloService.isConfigured()) {
+      console.log('[OutboundEngine] Apollo API key detected — using real contact data.');
+      try {
+        const apollo = new ApolloService();
+        const prospects = await apollo.findProspects({
+          icp: params.icp,
+          count: params.count,
+          orgName: params.org.name,
+        });
+
+        if (prospects.length > 0) {
+          console.log(`[OutboundEngine] Apollo returned ${prospects.length} real prospects.`);
+          return prospects;
+        }
+
+        // Apollo returned nothing (very narrow ICP) — fall through to LLM
+        console.warn('[OutboundEngine] Apollo returned 0 prospects. Falling back to LLM generation. Try broadening ICP filters.');
+      } catch (err: any) {
+        console.error(`[OutboundEngine] Apollo search failed: ${err.message}. Falling back to LLM.`);
+      }
+    }
+
+    // ── LLM fallback (demo / no Apollo key) ────────────────────────────────
+    console.log('[OutboundEngine] Using LLM-generated fictional prospects (set APOLLO_API_KEY for real contacts).');
+    if (!aiClient) throw new Error('No AI provider configured. Set OPENROUTER_API_KEY or APOLLO_API_KEY.');
 
     const completion = await aiClient.chat.completions.create({
       model: AI_MODEL,
@@ -314,21 +344,20 @@ Our value prop addresses: ${params.org.goals}
 
 Generate realistic but fictional prospects. Use plausible names, company names, and professional email formats (firstname@company.com).
 
-Return JSON array:
-[
-  {
-    "name": "Full name",
-    "email": "professional@company.com",
-    "company": "Company Name",
-    "title": "Job title",
-    "phone": "+1 555 000 0000",
-    "estimatedValue": (realistic deal value in USD based on company size),
-    "icpFitReason": "1-sentence reason this prospect fits our ICP perfectly"
-  },
-  ... (${params.count} prospects)
-]
-
-Vary the industries within the target sector, company sizes, and geographies. Make them feel real.`,
+Return JSON:
+{
+  "prospects": [
+    {
+      "name": "Full name",
+      "email": "professional@company.com",
+      "company": "Company Name",
+      "title": "Job title",
+      "phone": "+1 555 000 0000",
+      "estimatedValue": (realistic deal value in USD based on company size),
+      "icpFitReason": "1-sentence reason this prospect fits our ICP perfectly"
+    }
+  ]
+}`,
       }],
       temperature: 0.8,
       response_format: { type: 'json_object' },
@@ -336,8 +365,7 @@ Vary the industries within the target sector, company sizes, and geographies. Ma
 
     let raw: any;
     try {
-      const parsed = JSON.parse(completion.choices[0]?.message?.content ?? '[]');
-      // Handle both array and {prospects: [...]} shapes
+      const parsed = JSON.parse(completion.choices[0]?.message?.content ?? '{}');
       raw = Array.isArray(parsed) ? parsed : (parsed.prospects ?? parsed.data ?? []);
     } catch {
       raw = [];

@@ -43,7 +43,7 @@ class AtlasEmailService {
     const mailerSendToken = process.env.MAILERSEND_API_TOKEN;
     const resendKey = process.env.RESEND_API_KEY;
     const sendgridKey = process.env.SENDGRID_API_KEY;
-    const fromRaw = params.from ?? process.env.EMAIL_FROM ?? 'Atlas OS <atlas@atlasos.dpdns.org>';
+    const fromRaw = params.from ?? process.env.EMAIL_FROM ?? 'Atlas OS <contact@atlasos.dpdns.org>';
     const recipients = Array.isArray(params.to) ? params.to : [params.to];
 
     // Parse "Name <email>" into separate parts

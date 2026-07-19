@@ -57,7 +57,7 @@ app.use('/api/v1/leads/:id/qualify', aiLimiter);
 
 // Raw body BEFORE json — required for SVIX webhook signature verification
 app.use('/api/webhooks', express.raw({ type: 'application/json' }), webhookRouter);
-app.use(express.json());
+app.use(express.json({ limit: '1mb' })); // cap request body size — prevents memory exhaustion
 app.use('/api/internal', internalRouter);
 
 // ─── Auth guard — applied to all /api/v1/* routes ─────────────────────────────
@@ -85,18 +85,61 @@ let sseClients: express.Response[] = [];
 
 export function broadcastEvent(event: unknown) {
   const data = `data: ${JSON.stringify(event)}\n\n`;
-  sseClients.forEach((c) => c.write(data));
+  // Write to each client individually — a broken client must not affect others
+  sseClients = sseClients.filter((c) => {
+    try {
+      c.write(data);
+      return true; // keep in list
+    } catch {
+      return false; // remove dead/closed connections
+    }
+  });
 }
 
+// ─── Org resolver ─────────────────────────────────────────────────────────────
+// Resolves the organization for a request.
+// When auth context is present (Clerk configured), uses the authenticated org.
+// Falls back to findFirst only in dev (no CLERK_SECRET_KEY).
+
+async function resolveOrgId(req: express.Request): Promise<string> {
+  // Auth context set by requireAuth middleware
+  if (res_locals_auth(req)?.organization?.id) {
+    return res_locals_auth(req)!.organization.id;
+  }
+  // Dev fallback — no Clerk configured
+  const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
+  if (!org) throw new Error('No initialized organization found.');
+  return org.id;
+}
+
+// Helper to access res.locals.auth from req (Express doesn't expose res on req)
+// We store it on req for convenience in standalone route handlers
+function res_locals_auth(req: any): import('./src/services/auth/types.js').AuthContext | undefined {
+  return req._authContext;
+}
+
+// Middleware to copy res.locals.auth onto req._authContext for standalone handlers
+app.use('/api/v1', (req: any, res: express.Response, next: express.NextFunction) => {
+  if (res.locals.auth) req._authContext = res.locals.auth;
+  next();
+});
+
 app.get('/api/v1/stream-events', (req, res) => {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-  });
-  res.write('\n');
-  sseClients.push(res);
-  req.on('close', () => { sseClients = sseClients.filter((c) => c !== res); });
+  try {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    res.write('\n');
+    sseClients.push(res);
+    req.on('close', () => {
+      sseClients = sseClients.filter((c) => c !== res);
+    });
+  } catch (err: any) {
+    console.error('[SSE] Failed to establish stream:', err.message);
+    if (!res.headersSent) res.status(500).end();
+  }
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -117,7 +160,7 @@ registerSSEBridge(broadcastEvent);
 
 /** Resolve org+executive from DB for the default (single) organization. */
 async function getOrgAndExec(execNameFragment: string) {
-  const org = await prisma.organization.findFirst({ where: { initialized: true } });
+  const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
   if (!org) throw new Error('No initialized organization found.');
   const exec = await prisma.aIExecutive.findFirst({
     where: { organizationId: org.id, name: { contains: execNameFragment } },
@@ -168,7 +211,7 @@ app.get('/api/v1/scheduler/status', (_req, res) => {
 
 // ─── Infrastructure metrics ───────────────────────────────────────────────────
 
-app.get('/api/v1/infrastructure/metrics', async (_req, res) => {
+app.get('/api/v1/infrastructure/metrics', async (req, res) => {
   try {
     const { SystemHealth } = await import('./src/infrastructure/health/SystemHealth.js');
     const { RedisHealth } = await import('./src/infrastructure/redis/RedisHealth.js');
@@ -185,7 +228,7 @@ app.get('/api/v1/infrastructure/metrics', async (_req, res) => {
     // Pull real integration connection status from DB
     let dbIntegrations: Array<{ provider: string; status: string; lastSyncAt: Date | null }> = [];
     try {
-      const org = await prisma.organization.findFirst({ where: { initialized: true } });
+      const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
       if (org) {
         dbIntegrations = await prisma.integration.findMany({
           where: { organizationId: org.id },
@@ -268,12 +311,22 @@ app.post('/api/v1/onboarding', async (req, res) => {
     const { name, industry, size, goals, challenges, softwareStack } = req.body;
     if (!name || !industry) return res.status(422).json({ error: 'Company name and industry are required.' });
 
-    // Upsert the organization record
-    const org = await prisma.organization.upsert({
-      where: { id: (await prisma.organization.findFirst())?.id ?? 'new' },
-      create: { name, industry, size: size ?? '1-10', goals: goals ?? '', challenges: challenges ?? '', softwareStack: softwareStack ?? '', initialized: true },
-      update: { name, industry, size: size ?? '1-10', goals: goals ?? '', challenges: challenges ?? '', softwareStack: softwareStack ?? '', initialized: true },
-    });
+    // Find existing org or create a new one atomically.
+    // Using createOrUpdate pattern to avoid race condition from findFirst + upsert.
+    let org = await prisma.organization.findFirst({ where: { initialized: true } });
+
+    if (org) {
+      // Re-onboarding an existing org — just update the profile
+      org = await prisma.organization.update({
+        where: { id: org.id },
+        data: { name, industry, size: size ?? org.size, goals: goals ?? '', challenges: challenges ?? '', softwareStack: softwareStack ?? '', initialized: true, updatedAt: new Date() },
+      });
+    } else {
+      // Fresh deployment — create the org
+      org = await prisma.organization.create({
+        data: { name, industry, size: size ?? '1-10', goals: goals ?? '', challenges: challenges ?? '', softwareStack: softwareStack ?? '', initialized: true },
+      });
+    }
 
     // Ensure executives are provisioned
     const { OrganizationService } = await import('./src/services/auth/index.js');
@@ -299,6 +352,7 @@ app.post('/api/v1/onboarding', async (req, res) => {
 
 app.get('/api/v1/onboarding/context', async (_req, res) => {
   try {
+    // Public route — no auth context yet. Find the org by initialized flag.
     const org = await prisma.organization.findFirst({ where: { initialized: true } });
     if (!org) return res.json({ context: { initialized: false }, briefing: null });
     const latestBriefing = await prisma.memory.findFirst({
@@ -311,9 +365,9 @@ app.get('/api/v1/onboarding/context', async (_req, res) => {
 
 // ─── Agents (AI Executives) ───────────────────────────────────────────────────
 
-app.get('/api/v1/agents', async (_req, res) => {
+app.get('/api/v1/agents', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.json({ agents: [] });
     const execs = await prisma.aIExecutive.findMany({
       where: { organizationId: org.id },
@@ -334,9 +388,9 @@ app.get('/api/v1/agents/:id', async (req, res) => {
 
 // ─── Decisions ────────────────────────────────────────────────────────────────
 
-app.get('/api/v1/decisions', async (_req, res) => {
+app.get('/api/v1/decisions', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.json({ decisions: [] });
     const decisions = await prisma.decision.findMany({
       where: { organizationId: org.id, status: 'pending' },
@@ -361,9 +415,9 @@ app.get('/api/v1/decisions', async (_req, res) => {
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/v1/decisions/history', async (_req, res) => {
+app.get('/api/v1/decisions/history', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.json({ decisions: [] });
     const decisions = await prisma.decision.findMany({
       where: { organizationId: org.id, status: { not: 'pending' } },
@@ -374,10 +428,12 @@ app.get('/api/v1/decisions/history', async (_req, res) => {
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/v1/decisions/:id/approve', async (req, res) => {
+app.post('/api/v1/decisions/:id/approve', async (req: any, res) => {
   try {
-    const decision = await prisma.decision.findUnique({
-      where: { id: req.params.id },
+    const orgId = await resolveOrgId(req);
+    // Fetch decision AND verify it belongs to this org — prevents cross-org approval
+    const decision = await prisma.decision.findFirst({
+      where: { id: req.params.id, organizationId: orgId },
       include: { createdBy: true },
     });
     if (!decision) return res.status(404).json({ error: 'Decision not found' });
@@ -387,7 +443,6 @@ app.post('/api/v1/decisions/:id/approve', async (req, res) => {
       data: { status: 'approved', approvedAt: new Date(), updatedAt: new Date() },
     });
 
-    // Memory record
     await prisma.memory.create({
       data: {
         organizationId: decision.organizationId,
@@ -401,7 +456,6 @@ app.post('/api/v1/decisions/:id/approve', async (req, res) => {
       },
     });
 
-    // Feed event
     await prisma.feedEvent.create({
       data: {
         organizationId: decision.organizationId,
@@ -424,12 +478,15 @@ app.post('/api/v1/decisions/:id/approve', async (req, res) => {
     }
 
     res.json({ success: true });
-  } catch (err: any) { res.status(500).json({ error: err.message }); }
+  } catch (err: any) { res.status(500).json({ error: 'Failed to approve decision.' }); }
 });
 
-app.post('/api/v1/decisions/:id/decline', async (req, res) => {
+app.post('/api/v1/decisions/:id/decline', async (req: any, res) => {
   try {
-    const decision = await prisma.decision.findUnique({ where: { id: req.params.id } });
+    const orgId = await resolveOrgId(req);
+    const decision = await prisma.decision.findFirst({
+      where: { id: req.params.id, organizationId: orgId },
+    });
     if (!decision) return res.status(404).json({ error: 'Decision not found' });
 
     const { reason } = req.body;
@@ -450,14 +507,14 @@ app.post('/api/v1/decisions/:id/decline', async (req, res) => {
     broadcastEvent({ type: 'decision_declined', data: { id: decision.id } });
 
     res.json({ success: true });
-  } catch (err: any) { res.status(500).json({ error: err.message }); }
+  } catch (err: any) { res.status(500).json({ error: 'Failed to decline decision.' }); }
 });
 
 // ─── Leads ────────────────────────────────────────────────────────────────────
 
-app.get('/api/v1/leads', async (_req, res) => {
+app.get('/api/v1/leads', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.json({ leads: [] });
     const leads = await prisma.lead.findMany({
       where: { organizationId: org.id },
@@ -476,7 +533,7 @@ app.get('/api/v1/leads', async (_req, res) => {
 
 app.post('/api/v1/leads', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
     const { name, company, email, phone, value, source } = req.body;
     if (!name || !email) return res.status(400).json({ error: 'Name and email are required.' });
@@ -491,25 +548,45 @@ app.post('/api/v1/leads', async (req, res) => {
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/v1/leads/import', async (req, res) => {
+app.post('/api/v1/leads/import', async (req: any, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
-    if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
+    const orgId = await resolveOrgId(req);
     const { csvText } = req.body;
     if (!csvText) return res.status(400).json({ error: 'CSV data is empty.' });
 
-    const rows = csvText.split('\n');
+    // Safety limits — prevent DoS via large CSV
+    if (csvText.length > 500_000) {
+      return res.status(413).json({ error: 'CSV too large. Maximum 500KB.' });
+    }
+
+    const rows = (csvText as string).split('\n');
+    const MAX_ROWS = 500;
+    const dataRows = rows.filter((r: string) => r.trim()).slice(0, MAX_ROWS + 1); // +1 to detect overflow
+
+    if (dataRows.length > MAX_ROWS) {
+      return res.status(400).json({ error: `CSV exceeds ${MAX_ROWS} row limit. Split into smaller batches.` });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     let created = 0; let skipped = 0;
     const reasons: string[] = [];
 
-    for (const [i, row] of rows.entries()) {
+    for (const [i, row] of dataRows.entries()) {
       if (i === 0 && row.toLowerCase().includes('name')) continue; // header
-      const cols = row.split(',').map((c: string) => c.trim());
+      const cols = row.split(',').map((c: string) => c.trim().substring(0, 500)); // cap field length
       if (!cols[0] || !cols[1]) { skipped++; reasons.push(`Row ${i + 1}: missing name/company`); continue; }
+
+      const email = cols[2];
+      if (email && !emailRegex.test(email)) {
+        skipped++;
+        reasons.push(`Row ${i + 1}: invalid email "${email}"`);
+        continue;
+      }
+
       await prisma.lead.create({
         data: {
-          organizationId: org.id, name: cols[0], company: cols[1],
-          email: cols[2] ?? `unknown-${Date.now()}@import.local`,
+          organizationId: orgId, name: cols[0], company: cols[1],
+          email: email ?? `unknown-${Date.now()}@import.local`,
           phone: cols[3] ?? null, value: Number(cols[4]) || 12000,
           source: 'inbound_webform', updatedAt: new Date(),
         },
@@ -517,16 +594,15 @@ app.post('/api/v1/leads/import', async (req, res) => {
       created++;
     }
 
-    // Feed event via Zephyr
-    const zephyr = await prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Zephyr' } } });
+    const zephyr = await prisma.aIExecutive.findFirst({ where: { organizationId: orgId, name: { contains: 'Zephyr' } } });
     if (zephyr) {
       await prisma.feedEvent.create({
-        data: { organizationId: org.id, executiveId: zephyr.id, action: 'CSV Import Complete', text: `${created} leads imported, ${skipped} skipped.`, status: 'success' },
+        data: { organizationId: orgId, executiveId: zephyr.id, action: 'CSV Import Complete', text: `${created} leads imported, ${skipped} skipped.`, status: 'success' },
       });
       broadcastEvent({ type: 'feed', data: { agentName: zephyr.name, action: 'CSV Import Complete', text: `${created} leads imported.` } });
     }
     res.json({ processed: created + skipped, created, skipped, reasons });
-  } catch (err: any) { res.status(500).json({ error: err.message }); }
+  } catch (err: any) { res.status(500).json({ error: 'CSV import failed.' }); }
 });
 
 // ─── Lead Qualification Flow ──────────────────────────────────────────────────
@@ -534,7 +610,7 @@ app.post('/api/v1/leads/import', async (req, res) => {
 
 app.post('/api/v1/leads/:id/qualify', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
 
     const lead = await prisma.lead.findFirst({ where: { id: req.params.id, organizationId: org.id } });
@@ -580,9 +656,9 @@ app.post('/api/v1/leads/:id/qualify', async (req, res) => {
 
 // ─── Proposals ────────────────────────────────────────────────────────────────
 
-app.get('/api/v1/proposals', async (_req, res) => {
+app.get('/api/v1/proposals', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.json({ proposals: [] });
     const proposals = await prisma.proposal.findMany({
       where: { organizationId: org.id },
@@ -603,9 +679,9 @@ app.get('/api/v1/proposals', async (_req, res) => {
 
 // ─── Memories ────────────────────────────────────────────────────────────────
 
-app.get('/api/v1/memories', async (_req, res) => {
+app.get('/api/v1/memories', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.json({ memories: [] });
     const memories = await prisma.memory.findMany({
       where: { organizationId: org.id },
@@ -625,7 +701,7 @@ app.get('/api/v1/memories', async (_req, res) => {
 
 app.post('/api/v1/memories', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
     const { text, type, actor, sourceSystem, tags } = req.body;
     if (!text) return res.status(400).json({ error: 'Text is required.' });
@@ -643,7 +719,7 @@ app.post('/api/v1/memories', async (req, res) => {
 
 app.post('/api/v1/memories/search', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.json({ results: [] });
     const { query, type } = req.body;
     if (!query) return res.status(400).json({ error: 'Query required.' });
@@ -662,9 +738,9 @@ app.post('/api/v1/memories/search', async (req, res) => {
 
 // ─── Feeds ────────────────────────────────────────────────────────────────────
 
-app.get('/api/v1/feeds', async (_req, res) => {
+app.get('/api/v1/feeds', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.json({ feeds: [] });
     const feeds = await prisma.feedEvent.findMany({
       where: { organizationId: org.id },
@@ -684,9 +760,9 @@ app.get('/api/v1/feeds', async (_req, res) => {
 
 // ─── Workflows ────────────────────────────────────────────────────────────────
 
-app.get('/api/v1/workflows', async (_req, res) => {
+app.get('/api/v1/workflows', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.json({ workflows: [] });
     const workflows = await prisma.workflow.findMany({
       where: { organizationId: org.id },
@@ -726,7 +802,7 @@ app.post('/api/v1/strategy-session', async (req, res) => {
     const { topic, threadHistory } = req.body;
     if (!topic) return res.status(400).json({ error: 'Topic is required.' });
 
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
 
     const atlasExec = await prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Atlas' } } });
@@ -747,7 +823,7 @@ app.post('/api/v1/command-center', async (req, res) => {
     const { command } = req.body;
     if (!command) return res.status(400).json({ error: 'Command is required.' });
 
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
 
     const atlasExec = await prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Atlas' } } });
@@ -763,9 +839,9 @@ app.post('/api/v1/command-center', async (req, res) => {
 
 // ─── Boardroom Report ─────────────────────────────────────────────────────────
 
-app.get('/api/v1/boardroom/report', async (_req, res) => {
+app.get('/api/v1/boardroom/report', async (req, res) => {
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (!org) return res.status(400).json({ error: 'Organization not initialized.' });
 
     const atlasExec = await prisma.aIExecutive.findFirst({ where: { organizationId: org.id, name: { contains: 'Atlas' } } });
@@ -790,7 +866,7 @@ app.post('/api/v1/boardroom/export', (_req, res) => {
 app.get('/api/v1/audit/summary', async (req, res) => {
   try {
     const { AuditLog } = await import('./src/infrastructure/audit/AuditLog.js');
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     const orgId = org?.id ?? 'default';
     const [summary, totals] = await Promise.all([AuditLog.dailySummary(orgId), AuditLog.totals()]);
     res.json({ summary, totals, checkedAt: new Date().toISOString() });
@@ -888,6 +964,20 @@ async function seedDemoData(orgId: string) {
   console.log('[Atlas] Demo data seeded: 3 leads, 1 proposal, 1 decision, 2 memories, 3 feed events.');
 }
 
+// ─── Global error handler ─────────────────────────────────────────────────────
+// Catches any error thrown from route handlers that wasn't caught by a
+// local try/catch. Returns a generic message — never leaks stack traces
+// or internal error details to the client.
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const status = err.status ?? err.statusCode ?? 500;
+  console.error('[Atlas] Unhandled route error:', err.message ?? err);
+  // Only expose the message in dev mode
+  const message = process.env.NODE_ENV === 'production'
+    ? 'An internal error occurred.'
+    : (err.message ?? 'An internal error occurred.');
+  res.status(status).json({ error: message });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // SERVER BOOT
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -911,7 +1001,7 @@ async function startServer() {
 
   // 2. Seed demo data for initialized organizations
   try {
-    const org = await prisma.organization.findFirst({ where: { initialized: true } });
+    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
     if (org) await seedDemoData(org.id);
   } catch (err: any) {
     console.warn(`[Atlas] Demo seed skipped: ${err.message}`);
@@ -994,3 +1084,4 @@ async function startServer() {
 }
 
 startServer();
+
