@@ -271,7 +271,7 @@ function ExecutiveCard({
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 
-export default function ExecutionAudit() {
+export default function ExecutionAudit({ authFetch }: { authFetch?: (url: string, options?: RequestInit) => Promise<Response> }) {
   const [summary, setSummary] = useState<Record<string, ExecutiveSummary>>({});
   const [totals, setTotals] = useState<AuditTotals>({ total: 0, succeeded: 0, failed: 0, retried: 0 });
   const [recentEntries, setRecentEntries] = useState<AuditEntry[]>([]);
@@ -281,12 +281,14 @@ export default function ExecutionAudit() {
   const [lastRefresh, setLastRefresh] = useState(new Date());
   const [activeTab, setActiveTab] = useState<'executives' | 'timeline'>('executives');
 
+  const doFetch = authFetch ?? fetch;
+
   const fetchData = useCallback(async () => {
     try {
       setFetchError(null);
       const [summaryRes, recentRes] = await Promise.all([
-        fetch('/api/v1/audit/summary'),
-        fetch('/api/v1/audit/recent?limit=100'),
+        doFetch('/api/v1/audit/summary'),
+        doFetch('/api/v1/audit/recent?limit=100'),
       ]);
       if (!summaryRes.ok) throw new Error(`Audit summary: HTTP ${summaryRes.status}`);
       if (!recentRes.ok) throw new Error(`Audit recent: HTTP ${recentRes.status}`);
@@ -303,7 +305,7 @@ export default function ExecutionAudit() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [doFetch]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 

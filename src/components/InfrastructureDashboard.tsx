@@ -122,17 +122,19 @@ function StatusBadge({ status }: { status: AnyStatus }) {
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-export default function InfrastructureDashboard() {
+export default function InfrastructureDashboard({ authFetch }: { authFetch?: (url: string, options?: RequestInit) => Promise<Response> }) {
   const [metrics, setMetrics] = useState<InfrastructureMetrics | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [lastRefresh, setLastRefresh] = useState(new Date());
 
+  const doFetch = authFetch ?? fetch;
+
   const fetchMetrics = async () => {
     try {
       setFetchError(null);
-      const res = await fetch('/api/v1/infrastructure/metrics');
+      const res = await doFetch('/api/v1/infrastructure/metrics');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setMetrics(data.metrics);

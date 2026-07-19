@@ -12,6 +12,7 @@ interface StrategySessionProps {
   agents: Agent[];
   onAddFeedAlert: (agentId: string, action: string, text: string, status: any) => void;
   onAddMemory: (text: string, type: any, actor: string) => void;
+  authFetch: (url: string, options?: RequestInit) => Promise<Response>;
 }
 
 interface Message {
@@ -29,10 +30,11 @@ interface Message {
   };
 }
 
-export default function StrategySession({ agents, onAddFeedAlert, onAddMemory }: StrategySessionProps) {
+export default function StrategySession({ agents, onAddFeedAlert, onAddMemory, authFetch }: StrategySessionProps) {
   const [topic, setTopic] = useState<string>('');
   const [sessionActive, setSessionActive] = useState<boolean>(false);
-  const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>(['finance_ai', 'sales_ai', 'marketing_ai']);
+  // Use real agent IDs from DB — initialized once agents load
+  const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [userInput, setUserInput] = useState<string>('');
   const [isTyping, setIsTyping] = useState<boolean>(false);
@@ -40,6 +42,13 @@ export default function StrategySession({ agents, onAddFeedAlert, onAddMemory }:
   const [activeRecommendation, setActiveRecommendation] = useState<any>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Initialize selection with first 3 real agent IDs once agents load
+  useEffect(() => {
+    if (agents.length > 0 && selectedAgentIds.length === 0) {
+      setSelectedAgentIds(agents.slice(0, 3).map((a) => a.id));
+    }
+  }, [agents]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -109,9 +118,8 @@ export default function StrategySession({ agents, onAddFeedAlert, onAddMemory }:
         content: msg.content,
       }));
 
-      const response = await fetch('/api/v1/strategy-session', {
+      const response = await authFetch('/api/v1/strategy-session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           topic,
           selectedAgents: selectedAgentIds,

@@ -387,10 +387,10 @@ export default function App() {
         </div>
 
         {/* Infrastructure Dashboard */}
-        <InfrastructureDashboard />
+        <InfrastructureDashboard authFetch={authFetch} />
 
         {/* Execution Audit Trail */}
-        <ExecutionAudit />
+        <ExecutionAudit authFetch={authFetch} />
       </div>
     );
   };
@@ -555,7 +555,7 @@ export default function App() {
           {currentView === 'workforce' && renderWorkforceView()}
           {currentView === 'pulse' && <OrganizationPulse agents={agents} />}
           {currentView === 'strategy' && (
-            <StrategySession agents={agents} onAddFeedAlert={handleAddFeedAlert} onAddMemory={handleAddMemory} />
+            <StrategySession agents={agents} onAddFeedAlert={handleAddFeedAlert} onAddMemory={handleAddMemory} authFetch={authFetch} />
           )}
           {(currentView === 'finance' || currentView === 'sales' || currentView === 'marketing') && (
             <DepartmentViews
