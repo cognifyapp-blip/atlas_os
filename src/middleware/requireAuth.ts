@@ -72,6 +72,12 @@ export async function requireAuth(
     return next();
   } catch (err) {
     if (err instanceof AuthError) {
+      // If the error is specifically that there's no org in the token,
+      // still pass through — resolveOrgId will use the single-org fallback.
+      // This handles users who sign in directly without a Clerk organization.
+      if (err.code === 'ORG_NOT_FOUND') {
+        return next();
+      }
       const status =
         err.code === 'UNAUTHORIZED' ? 403
         : err.code === 'UNAUTHENTICATED' ? 401

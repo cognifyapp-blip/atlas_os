@@ -97,25 +97,18 @@ export function broadcastEvent(event: unknown) {
 }
 
 // ─── Org resolver ─────────────────────────────────────────────────────────────
-// Resolves the organization for a request.
-// When auth context is present (Clerk configured), uses the authenticated org.
-// Falls back to findFirst only in dev (no CLERK_SECRET_KEY).
+// Resolves the org for route handlers.
+// Uses Clerk auth context when available; falls back to findFirst for
+// single-org deployments (users signed in directly, no Clerk org membership).
 
 async function resolveOrgId(req: express.Request): Promise<string> {
-  // Auth context set by requireAuth middleware
-  if (res_locals_auth(req)?.organization?.id) {
-    return res_locals_auth(req)!.organization.id;
-  }
-  // Dev fallback — no Clerk configured
-  const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
+  const authOrg = (req as any)._authContext?.organization;
+  if (authOrg?.id) return authOrg.id;
+
+  // Single-org fallback — works for direct sign-in and dev environments
+  const org = await prisma.organization.findFirst({ where: { initialized: true } });
   if (!org) throw new Error('No initialized organization found.');
   return org.id;
-}
-
-// Helper to access res.locals.auth from req (Express doesn't expose res on req)
-// We store it on req for convenience in standalone route handlers
-function res_locals_auth(req: any): import('./src/services/auth/types.js').AuthContext | undefined {
-  return req._authContext;
 }
 
 // Middleware to copy res.locals.auth onto req._authContext for standalone handlers
