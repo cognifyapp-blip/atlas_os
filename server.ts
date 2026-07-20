@@ -153,7 +153,7 @@ registerSSEBridge(broadcastEvent);
 
 /** Resolve org+executive from DB for the default (single) organization. */
 async function getOrgAndExec(execNameFragment: string) {
-  const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
+  const org = await prisma.organization.findFirst({ where: { initialized: true } });
   if (!org) throw new Error('No initialized organization found.');
   const exec = await prisma.aIExecutive.findFirst({
     where: { organizationId: org.id, name: { contains: execNameFragment } },
@@ -221,7 +221,7 @@ app.get('/api/v1/infrastructure/metrics', async (req, res) => {
     // Pull real integration connection status from DB
     let dbIntegrations: Array<{ provider: string; status: string; lastSyncAt: Date | null }> = [];
     try {
-      const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
+      const org = await prisma.organization.findFirst({ where: { initialized: true } });
       if (org) {
         dbIntegrations = await prisma.integration.findMany({
           where: { organizationId: org.id },
@@ -994,7 +994,7 @@ async function startServer() {
 
   // 2. Seed demo data for initialized organizations
   try {
-    const org = await prisma.organization.findUnique({ where: { id: await resolveOrgId(req) } });
+    const org = await prisma.organization.findFirst({ where: { initialized: true } });
     if (org) await seedDemoData(org.id);
   } catch (err: any) {
     console.warn(`[Atlas] Demo seed skipped: ${err.message}`);
